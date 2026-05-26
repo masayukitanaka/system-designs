@@ -13,23 +13,21 @@ sequenceDiagram
     participant N as Notification
 
     rect rgb(225, 240, 255)
-    Note over C,MQ: 同期処理 — 減算のみ行い、200を返してイベント発火
+    Note over C,MQ: 同期処理 — 予約(hold)のみ、まだお金は動かさない、200 + イベント
     C->>GW: POST /v1/transfers (Idempotency-Key, JWT)
     GW->>GW: JWT検証 / レート制限
     GW->>P: createTransfer(req)
-    P->>PG: transfersメタ書込 (status=DEBITED, note, idempotency_key)
+    P->>PG: transfersメタ書込 (status=DEBITED, amount, note, idempotency_key)
     alt キー既存 (重複)
         PG-->>P: 競合 → 保存済みレスポンス返却
         P-->>C: 200 (前回と同一)
     else 新規リクエスト
         P->>R: 日次/取引限度チェック ($500 / $2,500)
         P->>U: resolve(email/phone) → recipientId
-        P->>DDB: 送金者の最新台帳エントリを読む → balance_after, seq
-        Note over P,DDB: 単一 DynamoDB TransactWriteItems (原子的, 金額の真実)
-        P->>DDB: 送金者エントリput (seq+1, balance_after-=金額) 条件:seq+1未存在
-        P->>DDB: エスクローエントリput (balance_after+=金額) 条件:idempotency_key未使用
-        DDB-->>P: コミット (または ConditionalCheckFailed → 残高不足/再送 → 再試行/重複排除)
-        P-->>C: 200 OK (transfer_id, status=DEBITED)
+        Note over P,DDB: 資金を予約 — 条件付き UpdateItem (台帳記帳なし, エスクローなし)
+        P->>DDB: 送金者残高: held += 金額<br/>条件: available - held >= 金額 (満たさねば422残高不足)
+        DDB-->>P: OK (available据え置き — 実際のお金はまだ動かない)
+        P-->>C: 200 OK (transfer_id, status=DEBITED, 見た目の残高は減少)
         P->>MQ: TransferRequested
     end
     end
@@ -45,17 +43,18 @@ sequenceDiagram
     P->>F: fraud / AML チェック (怪しいマーチャント等)
     F->>X: AML スクリーニング (+ MLスコアリング)
     X-->>F: 結果
-    alt 却下 / 人手承認が必要
-        F-->>P: REVIEW または DENY
-        Note over P,DDB: 稀: 人による承認フロー → DENY時は補償
-        P->>DDB: TransactWriteItems 逆仕訳: ESCROW → 送金者 (phase=REVERSAL)
+    alt 却下 / モラトリアム中に取消
+        F-->>P: REVIEW または DENY (またはユーザー取消)
+        Note over P,DDB: holdを解放するだけ — お金は一度も動いていない
+        P->>DDB: 送金者残高: held -= 金額
         P->>PG: transfers.status = CANCELLED
     else 通過
         F-->>P: ALLOW
         Note over P: (2) モラトリアム — settle_after まで待機し取消可能にする
         P->>P: settle_after まで待機 (取消可能な期間)
-        Note over P,DDB: (3) トランザクション — 実際の振込 (DynamoDB TransactWriteItems)
-        P->>DDB: エスクロー+受取人エントリput (phase=ESCROW_TO_RECIPIENT)<br/>各々が新しいbalance_afterを持つ・最新seq+冪等で条件付き
+        Note over P,DDB: (3) 決済 — ここで実際にお金が動く (1回の TransactWriteItems)
+        P->>DDB: 送金者: available -= 金額, held -= 金額 + DEBIT台帳エントリ追記
+        P->>DDB: 受取人: available += 金額 + CREDIT台帳エントリ追記<br/>条件: idempotency_key が未決済
         P->>PG: transfers.status = SETTLED
         P->>MQ: TransferSettled
     end

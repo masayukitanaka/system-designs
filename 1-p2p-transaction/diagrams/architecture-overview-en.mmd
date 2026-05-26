@@ -14,7 +14,7 @@ graph TB
     end
 
     subgraph Core["Core Services (scope of this design)"]
-        PAYMENTS["<b>Payments Service</b><br/>SYNC: debit sender → escrow (DynamoDB Tx), return 200, fire event<br/>+ idempotency + double-entry ledger<br/>+ balance/history reads (from DynamoDB)<br/><i>(money truth in DynamoDB)</i>"]
+        PAYMENTS["<b>Payments Service</b><br/>SYNC: hold sender funds (no money moved), return 200, fire event<br/>SETTLE: move money + append ledger<br/>+ idempotency + balance/history reads (from DynamoDB)<br/><i>(money truth in DynamoDB)</i>"]
         WF["Settlement Workflow<br/>state machine: fraud → moratorium<br/>→ settle → notify<br/><i>(Step Functions if complex)</i>"]
         USER["User Directory Service<br/>phone/email → userId resolution"]
         NOTIFY["Notification Service<br/>Push / SMS / Email"]
@@ -26,7 +26,7 @@ graph TB
     end
 
     subgraph Data["Data Layer"]
-        DDB[("<b>DynamoDB — source of truth (money)</b><br/>full ledger (~12.6B rows/yr), append-only, 7-year, by account_id<br/>balance = latest entry's balance_after<br/>atomic via TransactWriteItems + idempotency guard")]
+        DDB[("<b>DynamoDB — source of truth (money)</b><br/>balance items (available / held) + ledger (~12.6B rows/yr, 7-year)<br/>POST: hold (reserve); SETTLE: move money + append ledger<br/>conditional writes + idempotency guard")]
         LEDGERDB[("PostgreSQL (Aurora)<br/>metadata: users / transfers meta / events / idempotency<br/>+ balance <i>display cache</i> (NOT authoritative)")]
         CACHE[("Redis<br/>cache / rate limit")]
         ARCHIVE[("S3 + Glacier<br/>long-term audit / DynamoDB export")]
@@ -40,7 +40,7 @@ graph TB
 
     MOBILE --> CDN --> WAF --> APIGW
     APIGW -->|JWT verify| AUTH
-    APIGW -->|sync: create + debit| PAYMENTS
+    APIGW -->|sync: create + hold| PAYMENTS
 
     PAYMENTS --> USER
     PAYMENTS --> CACHE

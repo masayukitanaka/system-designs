@@ -14,7 +14,7 @@ graph TB
     end
 
     subgraph Core["コアサービス (本設計のスコープ)"]
-        PAYMENTS["<b>Payments Service</b><br/>同期: 送金者→escrowへ減算 (DynamoDB Tx), 200返却, イベント発火<br/>+ 冪等性 + 二重仕訳台帳<br/>+ 残高/履歴の読取 (DynamoDBから)<br/><i>(金額の真実はDynamoDB)</i>"]
+        PAYMENTS["<b>Payments Service</b><br/>同期: 送金者をhold (お金は動かさない), 200返却, イベント発火<br/>決済: お金を動かす + 台帳追記<br/>+ 冪等性 + 残高/履歴の読取 (DynamoDBから)<br/><i>(金額の真実はDynamoDB)</i>"]
         WF["Settlement Workflow<br/>ステートマシン: fraud → モラトリアム<br/>→ 振込確定 → 通知<br/><i>(複雑なら Step Functions)</i>"]
         USER["User Directory Service<br/>電話/Email → userId 解決"]
         NOTIFY["Notification Service<br/>Push / SMS / Email"]
@@ -26,7 +26,7 @@ graph TB
     end
 
     subgraph Data["データ層"]
-        DDB[("<b>DynamoDB — 正 (金額)</b><br/>全台帳 (約126億行/年), 追記専用, 7年, account_id別<br/>残高 = 最新エントリのbalance_after<br/>TransactWriteItems + 冪等ガードで原子的")]
+        DDB[("<b>DynamoDB — 正 (金額)</b><br/>残高アイテム (available / held) + 台帳 (約126億行/年, 7年)<br/>POST: hold(予約); SETTLE: 送金 + 台帳追記<br/>条件付き書込 + 冪等ガード")]
         LEDGERDB[("PostgreSQL (Aurora)<br/>メタデータ: users / transfersメタ / events / idempotency<br/>+ 残高<i>表示キャッシュ</i> (正ではない)")]
         CACHE[("Redis<br/>キャッシュ / レート制限")]
         ARCHIVE[("S3 + Glacier<br/>監査長期保管 / DynamoDBエクスポート")]
@@ -40,7 +40,7 @@ graph TB
 
     MOBILE --> CDN --> WAF --> APIGW
     APIGW -->|JWT検証| AUTH
-    APIGW -->|同期: 作成 + 減算| PAYMENTS
+    APIGW -->|同期: 作成 + hold| PAYMENTS
 
     PAYMENTS --> USER
     PAYMENTS --> CACHE

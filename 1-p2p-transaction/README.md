@@ -250,7 +250,7 @@ This document progressively elaborates in the order "overview → design princip
 3. **Immutable Audit Log**: The ledger is append-only. Balance is the aggregated result of ledger entries and is never overwritten.
 4. **Tiered consistency**: Balances/ledger use **strong consistency (synchronous)**; notifications/history reflection use **eventual consistency (asynchronous)**.
 5. **Failure-oriented design**: Assume every component can fail; eliminate SPOFs and add redundancy across Multi-AZ.
-6. **Sync debit, async settle**: The sender is debited into escrow synchronously (immediate, authoritative feedback + funds reserved), and the recipient is credited by an async workflow (fraud/AML → moratorium → settle). The "instant settlement" requirement is met via a **risk-tiered moratorium** that defaults to ~0 for low-risk transfers (effectively instant) and applies a short hold only to higher-risk ones — see §4.3 and the trade-offs in §7.2.
+6. **Sync hold, async settle — money moves only at settlement**: The synchronous step does **not** move money; it places a **hold** on the sender (reserving the amount so the displayed/available balance drops immediately) and returns. The actual debit of the sender and credit of the recipient happen **only at settlement**, after the async workflow (fraud/AML → moratorium). No escrow/clearing account is used. The "instant settlement" requirement is met via a **risk-tiered moratorium** that defaults to ~0 for low-risk transfers (effectively instant) and applies a short hold only to higher-risk ones — see §4.3 and the trade-offs in §7.2.
 
 #### Back-of-the-envelope Capacity Estimate
 | Item | Calculation | Result |
@@ -265,7 +265,7 @@ This document progressively elaborates in the order "overview → design princip
 > **Important**: All monetary amounts are held as `bigint` (minor units such as cents) to eliminate rounding errors.
 
 > **Key sizing decision — polyglot persistence, DynamoDB for money**: ~12.6B ledger rows/year is **too much for PostgreSQL**, so the entire transaction/ledger system and balances live in **DynamoDB**, which scales horizontally for this volume. PostgreSQL holds only **non-money metadata** plus a balance **display cache**:
-> - **DynamoDB (source of truth for money)** — the full `ledger_entries` (append-only, 7-year, partitioned by `account_id`, sort key `seq`). **There is no separate balance record: each ledger entry stores the post-transaction `balance_after`, so the current balance is simply the latest entry's `balance_after`.** Money movement is an atomic **`TransactWriteItems`** that appends the balanced entries; double-processing is blocked by the client's **Idempotency-Key** (conditional `attribute_not_exists`).
+> - **DynamoDB (source of truth for money)** — per-account **balance items** (`available` + `held`) and the full `ledger_entries` (append-only, 7-year, partitioned by `account_id`, sort key `seq`). At POST a conditional update reserves funds (`held += amount`); at settlement an atomic **`TransactWriteItems`** moves the money (sender `available -= amount, held -= amount`; recipient `available += amount`) and appends the ledger entries. Double-processing is blocked by the client's **Idempotency-Key**.
 > - **PostgreSQL (metadata + cache)** — `users`, `user_identifiers`, `transfers` metadata (status, searchable memo), `transfer_events` (workflow state), `idempotency_keys`. It also keeps a **balance display cache** (`balance_cache_minor`) refreshed from **DynamoDB Streams** — *never* authoritative and *never* used for the debit decision.
 
 ---
@@ -360,35 +360,35 @@ Core services are deployed on **Amazon EKS** on AWS. Data stores (Aurora / Elast
 
 | Entity | Store | Role | Key Points |
 |--------|-------|------|------------|
-| **ledger** | **DynamoDB** | Full double-entry ledger **and** balance | All entries, append-only, 7-year. Partition key `account_id`, sort key `seq` (per-account sequence); GSI on `transfer_id`. Each entry carries `balance_after`, so **the current balance is the latest entry's `balance_after`** — no separate balance record. ~12.6B rows/yr. The source of truth for **money + history/audit** |
+| **balance** | **DynamoDB** | Authoritative balance | Per-account item with `available_minor` (real balance) + `held_minor` (reserved by in-flight transfers) + `version`. **Spendable = available − held.** POST reserves (`held +=`); settlement moves (`available -=`/`+=`). Updated by conditional write |
+| **ledger** | **DynamoDB** | Full double-entry ledger | All entries, append-only, 7-year. Partition key `account_id`, sort key `seq`; GSI on `transfer_id`. **Appended only at settlement** (DEBIT/CREDIT/REVERSAL), carrying `balance_after`. ~12.6B rows/yr. Source of truth for **history/audit** |
 | **users** | PostgreSQL | Users (KYC done) | Synced from upstream. Reference-centric metadata |
 | **user_identifiers** | PostgreSQL | Email/phone → userId | Unique index on `value`. Used for recipient resolution |
-| **accounts (meta)** | PostgreSQL | Account metadata + balance **cache** | `type` (USER / **ESCROW**), currency, etc. `balance_cache_minor` is a **display cache only** (refreshed from DynamoDB Streams), never authoritative, never used for the debit decision |
+| **accounts (meta)** | PostgreSQL | Account metadata + balance **cache** | currency, etc. `balance_cache_minor` is a **display cache only** (refreshed from DynamoDB Streams), never authoritative, never used for the debit decision |
 | **transfers (meta)** | PostgreSQL | Transfer metadata / search / workflow | Lifecycle `status` (`DEBITED → FRAUD_REVIEW → MORATORIUM → SETTLED`, or `CANCELLED`/`REVERSED`), searchable `note`, `settle_after`. Unique constraint on `idempotency_key`. **Money amounts live in DynamoDB, not here** |
 | **transfer_events** | PostgreSQL | Workflow tracking | Each async step (`FRAUD`/`MORATORIUM`/`SETTLE`/`NOTIFY`) and its state — the durable state of the settlement workflow |
 | **idempotency_keys** | PostgreSQL | Idempotency control | Request hash + response. (The DynamoDB transaction also carries its own idempotency guard item — see below.) |
 
-#### Concept of the Double-Entry Ledger (with escrow)
-Because the recipient credit is **deferred** (async settlement after fraud + moratorium), money never vanishes in between: the synchronous step moves funds from the sender **into a system escrow (clearing) account**, and settlement later moves them from escrow to the recipient. Every phase is a **balanced pair that sums to zero**.
-
-Each phase is one **DynamoDB `TransactWriteItems`** that appends the balanced ledger entries. Each entry records the running `balance_after`, computed from the previous latest entry — so **the balance is carried by the ledger itself**, not a separate item:
+#### Hold-then-settle (no escrow)
+The recipient credit is **deferred** until after fraud/AML + moratorium. We do **not** move money to an escrow account in between. Instead, the synchronous step only **reserves** the amount on the sender via a `held` counter; the real debit and credit happen together **only at settlement**. The displayed/available balance drops immediately (because available − held shrinks), but no funds have actually moved until settlement.
 
 ```
-Phase 1 (SYNC, at POST):   sender → escrow   [one TransactWriteItems]
-  read latest entry of sender (balance_after=B_s, seq=N_s) and escrow (B_e, N_e)
-  - put sender entry (seq=N_s+1, amount=-1000, balance_after=B_s-1000, phase=DEBIT_TO_ESCROW)
-        condition: no item at (sender, N_s+1)         ← optimistic lock on the latest entry
-  - put escrow entry (seq=N_e+1, amount=+1000, balance_after=B_e+1000, phase=DEBIT_TO_ESCROW)
-        condition: idempotency_key not already recorded ← blocks double-processing
+At POST (SYNC):   reserve on sender   [one conditional UpdateItem — no ledger entry, no escrow]
+  UpdateItem sender balance: held += amount
+    condition: available - held >= amount   ← rejects insufficient funds (HTTP 422) right here
+  (available is unchanged — real money has NOT moved)
 
-Phase 2 (ASYNC, at settlement):  escrow → recipient   [one TransactWriteItems]
-  - put escrow + recipient entries (phase=ESCROW_TO_RECIPIENT), same conditions
+At SETTLEMENT (ASYNC, after moratorium):  move the money   [one TransactWriteItems]
+  - sender    : available -= amount, held -= amount   + append DEBIT ledger entry (balance_after)
+  - recipient : available += amount                   + append CREDIT ledger entry (balance_after)
+    condition: idempotency_key not already settled     ← exactly-once settlement
+  → the DEBIT and CREDIT sum to zero (conservation of funds)
 
-  → Σ amount = 0 at every phase (conservation of funds; escrow nets to 0 once settled)
-  Cancellation instead writes a REVERSAL TransactWriteItems (escrow → sender).
+Cancellation (during moratorium / on DENY):  just release the hold
+  UpdateItem sender balance: held -= amount     (no ledger entry — money never moved)
 ```
 
-**Where is the truth?** **Money lives in DynamoDB, in the ledger.** Each ledger entry is one transaction and records the post-transaction `balance_after`; the current balance is read directly as the **latest entry's `balance_after`** (query the account partition, highest `seq`) — there is no separate balance record to keep in sync. Correctness comes from two conditions on the append: the `seq=N+1`-not-exists condition is an **optimistic lock** so two concurrent writes can't both chain off the same latest entry (the loser retries against the new latest), and the **Idempotency-Key** condition makes a retried request a no-op (no double debit). **PostgreSQL holds no authoritative money** — its `balance_cache_minor` is a display cache refreshed asynchronously from DynamoDB Streams and is never read for the debit decision. This is a deliberate **polyglot-persistence** split: DynamoDB for the massive, horizontally-scaled ledger; PostgreSQL for rich relational metadata, search, and workflow state.
+**Where is the truth?** **Money lives in DynamoDB.** The authoritative balance is the per-account balance item (`available`, `held`); **spendable = available − held**. The double-spend check is the conditional `available - held >= amount` on the POST hold — done atomically against DynamoDB, never the cache. Ledger entries are written **only at settlement** (when money truly moves) and carry `balance_after` for audit. **PostgreSQL holds no authoritative money** — its `balance_cache_minor` is a display cache refreshed asynchronously from DynamoDB Streams and is never read for the debit decision. This is a deliberate **polyglot-persistence** split: DynamoDB for the high-volume balance + ledger; PostgreSQL for rich relational metadata, search, and workflow state.
 
 ### 4.2 Key Endpoints (API Contract)
 
@@ -415,7 +415,7 @@ Idempotency-Key: 5f3c...e9   # client-generated UUID
 }
 ```
 #### Example Response
-The synchronous response returns immediately after the sender is debited into escrow; the recipient is credited later by the async workflow.
+The synchronous response returns immediately after the sender's funds are **held** (reserved); no money has moved yet. The actual debit/credit happen at settlement.
 ```json
 {
   "transfer_id": "txn_01H...",
@@ -435,16 +435,16 @@ The flow is deliberately split into a **short synchronous path** (so `POST /v1/t
 **Synchronous (`POST /v1/transfers` → 200 OK + event):**
 1. **Metadata + idempotency**: Write the `transfers` metadata row to PostgreSQL (unique constraint on `idempotency_key`); a duplicate conflicts and the stored response is returned.
 2. **Limit check** (e.g. $500/txn, $2,500/day) and **recipient resolution** happen here — cheap to reject early.
-3. **Debit only, into escrow — in DynamoDB**: Read the sender's and escrow's latest ledger entries (their `balance_after`, `seq`), then one **`TransactWriteItems`** appends the sender entry (`seq+1`, `balance_after-=amount`) and escrow entry (`seq+1`, `balance_after+=amount`), both `phase=DEBIT_TO_ESCROW`. Conditions: `seq+1` must not already exist (optimistic lock; also fails if `balance_after` would go negative → insufficient funds) and the Idempotency-Key must be unseen. `ConditionalCheckFailed` → retry against the new latest, or dedupe a replay. The recipient is **not** credited yet.
+3. **Hold only — in DynamoDB**: One conditional `UpdateItem` on the sender's balance item sets `held += amount` with condition `available - held >= amount`. `ConditionalCheckFailed` → insufficient funds, return 422 immediately. No ledger entry and no money movement yet. (Idempotency: the prior `transfers` metadata write keyed by `idempotency_key` makes a replayed POST return the stored response instead of holding twice.)
 4. Return `200 OK (status=DEBITED)` and publish `TransferRequested` to Kafka.
 
 **Asynchronous settlement workflow (state machine; AWS Step Functions if it grows complex):**
-1. **Fraud / AML check**: Suspicious-merchant and AML screening. A small fraction may require a **human approval flow**. On deny → compensate with a `REVERSAL` `TransactWriteItems` (escrow → sender) and set `transfers.status=CANCELLED`.
-2. **Moratorium**: Wait until `settle_after` so the user can still cancel the transfer (cancellable window).
-3. **Settlement (the actual transfer)**: One `TransactWriteItems` moves escrow → recipient (`phase=ESCROW_TO_RECIPIENT`); update `transfers.status=SETTLED` in PostgreSQL.
+1. **Fraud / AML check**: Suspicious-merchant and AML screening. A small fraction may require a **human approval flow**. On deny → **release the hold** (`held -= amount`, no ledger entry — money never moved) and set `transfers.status=CANCELLED`.
+2. **Moratorium**: Wait until `settle_after` so the user can still cancel the transfer (cancellable window). Cancel = release the hold, same as above.
+3. **Settlement (money actually moves now)**: One `TransactWriteItems` debits the sender (`available -= amount, held -= amount`, append DEBIT) and credits the recipient (`available += amount`, append CREDIT), conditioned on the Idempotency-Key not yet settled; update `transfers.status=SETTLED` in PostgreSQL.
 4. **Notification**: Notify both the sender and the recipient (Push/SMS/Email).
 
-> **Why this split?** Debiting synchronously gives the sender immediate, authoritative feedback and reserves the funds (the conditional DynamoDB write prevents double-spend), while deferring the credit lets us run fraud/AML and offer a cancellation window without holding the client request open. Escrow keeps the ledger balanced at every step, and `transfer_events` (PostgreSQL) makes the workflow durable and resumable after a crash.
+> **Why this split?** The synchronous hold gives the sender immediate feedback and reserves the funds (the conditional `available - held >= amount` write prevents double-spend) **without moving money**, while deferring the actual transfer lets us run fraud/AML and offer a cancellation window. Because no money has moved until settlement, a cancellation is just releasing a hold — there is nothing to claw back. `transfer_events` (PostgreSQL) makes the workflow durable and resumable after a crash.
 
 ---
 
@@ -472,8 +472,8 @@ The flow is deliberately split into a **short synchronous path** (so `POST /v1/t
 ## 6. Realizing Non-Functional Requirements (Performance)
 
 ### 6.1 Latency (Target p99 ≤ 3 seconds)
-- **Minimize the synchronous path**: The synchronous request only does "idempotency check → limit check → recipient resolution → debit into escrow → return 200." Fraud/AML, the moratorium, settlement, and notifications are all moved to the async workflow, keeping the user-facing latency well under 3 seconds.
-- **Balance reads**: The authoritative balance is the **latest ledger entry's `balance_after`** — a single query on the account partition for the highest `seq` (low-latency, strongly-consistent when needed). The PostgreSQL `balance_cache_minor` may back fast UI display, but the **debit decision always reads/conditions on DynamoDB**, never the cache.
+- **Minimize the synchronous path**: The synchronous request only does "idempotency check → limit check → recipient resolution → **hold funds** → return 200." Fraud/AML, the moratorium, settlement, and notifications are all moved to the async workflow, keeping the user-facing latency well under 3 seconds.
+- **Balance reads**: The authoritative balance is the DynamoDB balance item (`available`, `held`); **spendable = available − held**, a single fast key read. The PostgreSQL `balance_cache_minor` may back UI display, but the **hold/settle decision always reads/conditions on DynamoDB**, never the cache.
 - **Connection pooling**: Reuse PostgreSQL connections with RDS Proxy / PgBouncer; DynamoDB is accessed over HTTP with the SDK's connection reuse.
 - **Hot-account note**: Because each account's writes chain through `seq`, a single very hot account (e.g. a popular merchant) serializes its own writes. That is correct (its true running balance is inherently sequential); to scale such an account, see the sub-account option in §7.2.
 
@@ -490,11 +490,11 @@ The flow is deliberately split into a **short synchronous path** (so `POST /v1/t
 - **Circuit breakers & timeouts**: Cut off + fall back so that latency in external APIs (ML/AML/bank) does not drag down the whole system.
 
 ### 6.4 Consistency & Reliability
-- **Atomic money movement in DynamoDB**: The balanced ledger entries are appended in one **`TransactWriteItems`** with conditional expressions: the next-`seq`-not-exists condition prevents a lost update (overspend), and the `attribute_not_exists` on the Idempotency-Key blocks double-processing. `balance_after` is computed in the same write. All-or-nothing — no partial debit/credit, no overspend, no double-apply.
+- **Atomic money movement in DynamoDB**: The POST hold is a conditional `UpdateItem` (`available - held >= amount`) preventing overspend. Settlement is one **`TransactWriteItems`** (sender debit + recipient credit + both ledger entries) conditioned on the Idempotency-Key not yet settled — all-or-nothing, exactly once. No partial debit/credit, no overspend, no double-apply.
 - **Cache is asynchronous, never authoritative**: The PostgreSQL `balance_cache_minor` is refreshed from **DynamoDB Streams** (eventually consistent). It is display-only; staleness can never cause a wrong debit because debits read/condition on the DynamoDB ledger.
 - **Cross-store metadata**: The `transfers` metadata write (PostgreSQL) and the money write (DynamoDB) are two stores; we write the metadata row (with the idempotency key) first, then the conditional DynamoDB transaction. A crash between them is reconciled by the workflow (a `DEBITED` metadata row with no matching ledger entry is retried or rolled back).
 - **Idempotent everywhere**: The Idempotency-Key condition in the DynamoDB transaction and the Kafka consumers' dedupe by `transfer_id` make retries safe.
-- **Continuous reconciliation**: A job replays an account's ledger entries and checks that each `balance_after` chains correctly (prev + amount = next) and that escrow nets to the in-flight total; divergence raises an alert.
+- **Continuous reconciliation**: A job replays an account's settled ledger entries and checks the chain (prev + amount = next = `available`), and that each account's `held` equals the sum of its in-flight (DEBITED/FRAUD_REVIEW/MORATORIUM) transfers; divergence raises an alert.
 
 ---
 
@@ -507,10 +507,10 @@ The volume (~12.6B ledger rows/year) rules out PostgreSQL for the ledger, so mon
 
 | Aspect | DynamoDB (money: ledger + balance) | PostgreSQL (metadata + cache) |
 |--------|------------------------------------|-------------------------------|
-| **Holds** | Full ledger, 7-year, append-only; balance = latest entry's `balance_after` | users, transfers meta, workflow events, **balance display cache** |
+| **Holds** | Balance items (`available`/`held`) + full ledger (7-year, append-only) | users, transfers meta, workflow events, **balance display cache** |
 | **Transactions** | `TransactWriteItems` (up to 25 items) — atomic balanced entries + conditions | Multi-row ACID for metadata (not money) |
 | **Scaling** | Near-unlimited horizontal scale, partitioned by `account_id` | Bounded, small relational data; easy to operate |
-| **Consistency** | Strongly-consistent read of latest entry + conditional append for the debit | The cache is eventually consistent (DynamoDB Streams); never authoritative |
+| **Consistency** | Strongly-consistent conditional writes (hold check, settlement) | The cache is eventually consistent (DynamoDB Streams); never authoritative |
 | **Why** | Massive write throughput + cheap long-term retention for the ledger | Rich queries: search by memo, joins, workflow state, reporting |
 
 > Trade-off: putting money in DynamoDB means **overspend prevention and ordering must be expressed as conditional appends** (optimistic lock on the next `seq`) rather than SQL `SERIALIZABLE`, and per-account writes are serialized by the `seq` chain. We accept this because the ledger volume is infeasible for PostgreSQL, and the conditional `TransactWriteItems` gives both scale (across accounts) and correctness (within an account). The metadata/cache in PostgreSQL is eventually consistent with DynamoDB (via Streams), reconciled by a continuous job. **Alternatives**: (a) all-PostgreSQL with partitioning + S3 archival — simplest consistency story but the row volume is operationally infeasible; (b) money in PostgreSQL, history in DynamoDB (an earlier iteration) — keeps SQL ACID for balances but still needs cross-store sync and caps write scale at the relational Writer. Putting the whole ledger in DynamoDB is the choice when ledger scale dominates.
@@ -518,7 +518,7 @@ The volume (~12.6B ledger rows/year) rules out PostgreSQL for the ledger, so mon
 ### 7.2 Other Tunable Points
 | Tunable axis | Option A | Option B | Trade-off |
 |--------------|----------|----------|-----------|
-| **Transfer confirmation** | Fully synchronous (immediate COMPLETED) | **Sync debit + async settle** (chosen) | Fully sync gives the simplest UX but leaves no room for fraud review / cancellation and couples settlement to request availability. We chose sync-debit-into-escrow + async settlement: the sender gets immediate authoritative feedback, while fraud/AML and a moratorium run off the critical path. Trade-off: the recipient sees funds after settlement, not instantly — acceptable given the moratorium/fraud requirements |
+| **Transfer confirmation** | Fully synchronous (immediate COMPLETED) | **Sync hold + async settle** (chosen) | Fully sync gives the simplest UX but leaves no room for fraud review / cancellation. We chose sync-hold + async settlement: the sender's available balance drops immediately (funds reserved, no money moved), while fraud/AML and a moratorium run off the critical path; money actually moves at settlement. Trade-off: the recipient sees funds after settlement, not instantly — acceptable given the moratorium/fraud requirements |
 | **Moratorium length** | 0 (settle immediately) | Minutes–hours | Longer window = more cancellation/fraud safety but slower perceived delivery. Tunable per risk tier (e.g. new recipient, large amount) via `settle_after` |
 | **Consistency model** | Strong consistency (balance/ledger in DynamoDB) | Eventual consistency (PG balance cache, notifications) | Money uses strongly-consistent conditional writes in DynamoDB. The PostgreSQL display cache and notifications are eventually consistent for availability (CAP trade-off) |
 | **Very hot account** | Single ledger per account (chosen) | Split into N **sub-accounts** | Because per-account writes serialize on the `seq` chain, an extremely hot account (a giant merchant) could become a write hotspot. If needed, model it as N sub-accounts (each its own ledger partition) and sum/route across them — adds routing + aggregation complexity, so apply only to the rare hotspot, not by default |
@@ -534,13 +534,13 @@ The volume (~12.6B ledger rows/year) rules out PostgreSQL for the ledger, so mon
 Centered on the deep-dive questions in Part 3, this section lists points likely to be asked in an interview along with model answers.
 
 ### Q1. If the server crashes mid-transfer, how do you recover?
-**A.** Each money-moving step (the synchronous debit-to-escrow, and the asynchronous settlement) is a single **DynamoDB `TransactWriteItems`**, which is all-or-nothing — a crash before it commits leaves no partial debit/credit. The settlement workflow is **durable, not in-memory**: its progress lives in `transfers.status` and `transfer_events` (PostgreSQL). A crash mid-workflow is recovered by re-driving from the last persisted state; each step is idempotent — the DynamoDB transaction carries a guard item keyed by `transfer_id`/phase, so re-execution is a no-op (`ConditionalCheckFailed`) rather than a double-apply. Because the recipient is only credited at settlement (not at the synchronous step), a crash after the debit simply leaves funds safely in **escrow** until the workflow resumes. The one cross-store gap — `transfers` metadata in PostgreSQL written just before the DynamoDB money write — is reconciled: a `DEBITED` metadata row with no matching DynamoDB ledger entry is retried or rolled back by a sweeper. If the orchestration grows complex, AWS Step Functions provides this durable execution out of the box.
+**A.** No money moves until settlement, which is a single **DynamoDB `TransactWriteItems`** (all-or-nothing) — a crash before it commits leaves no partial debit/credit. The synchronous step only places a `held` reservation; a crash there leaves at most an orphaned hold, which is harmless and swept (released) by a reconciliation job that matches holds to in-flight `transfers`. The settlement workflow is **durable, not in-memory**: its progress lives in `transfers.status` and `transfer_events` (PostgreSQL), so a crash mid-workflow re-drives from the last persisted state. Settlement is idempotent — conditioned on the Idempotency-Key not yet settled — so re-execution is a no-op rather than a double-apply. If the orchestration grows complex, AWS Step Functions provides this durable execution out of the box.
 
 ### Q2. If the same request arrives twice due to a network retry, how do you prevent a double transfer?
 **A.** Require a client-generated `Idempotency-Key`. Two layers: (1) the PostgreSQL `transfers` metadata row has a **unique constraint** on `idempotency_key`, so a duplicate create conflicts and returns the prior response; (2) more importantly, the money mutation's **`TransactWriteItems` includes a guard item** keyed by `transfer_id`/phase with an `attribute_not_exists` condition — so even if the same transaction is retried, the conditional write fails (`ConditionalCheckFailed`) and the balance is debited exactly once. Idempotency thus protects the money write atomically inside DynamoDB, not just at the metadata layer. The stored request hash also lets us reject "the same key with a different body" as a conflict.
 
 ### Q3. If a balance read and update happen concurrently, how do you ensure consistency?
-**A.** The balance is carried by the ledger: each new entry records `balance_after`, computed from the account's current latest entry (`seq=N`, `balance_after=B`). The append writes the next entry at `seq=N+1` with a condition that **no item at `seq=N+1` already exists** (optimistic lock). Two concurrent debits both read `seq=N` and try to write `seq=N+1`; DynamoDB lets exactly one win, the other gets `ConditionalCheckFailed` and retries against the new latest (`seq=N+1`, recomputing `balance_after`). So there is no lost update and no overspend — the read-compute-append is effectively serialized per account, and the check and write are one atomic conditional operation (no TOCTOU). The balance is **never** read from the PostgreSQL cache for this decision. A reconciliation job replays the chain to confirm each `balance_after` is consistent.
+**A.** The balance is a DynamoDB item (`available`, `held`, `version`) mutated only by conditional writes. The POST hold is `UpdateItem held += amount` with condition `available - held >= amount` — the check and the write are one atomic operation (no TOCTOU). Two concurrent holds race on the condition; DynamoDB serializes them on the item, so each sees the other's effect and neither can push spendable negative (no overspend, no lost update). Optionally a `version` (optimistic lock) catches concurrent settlement vs. cancellation. The decision is **never** made against the PostgreSQL cache. A reconciliation job confirms each account's `held` equals the sum of its in-flight transfers and that the settled ledger chains to `available`.
 
 ### Q4. Where are the SPOFs (single points of failure), and how do you eliminate them?
 **A.**
@@ -555,7 +555,7 @@ Centered on the deep-dive questions in Part 3, this section lists points likely 
 ### Q5. If transaction volume increases 10x (~10,000 TPS), where is the bottleneck and how do you scale?
 **A.** The ledger is in **DynamoDB**, partitioned by `account_id`, so aggregate throughput scales horizontally near-linearly — the money store is not the first wall. The pressure points and countermeasures, incrementally:
 1. **A single very hot account** is the main risk — its writes serialize on the per-account `seq` chain (correct, but a hotspot). If one account dominates, model it as N **sub-accounts** (each its own ledger partition) and route/aggregate across them (see §7.2). Most accounts never need this.
-2. Keep the synchronous path minimal (one `TransactWriteItems` debit-to-escrow); push fraud/moratorium/settlement/notify to the async workflow.
+2. Keep the synchronous path minimal (one conditional hold `UpdateItem`); push fraud/moratorium/settlement/notify to the async workflow.
 3. Use **DynamoDB on-demand or auto-scaling** so capacity tracks the write stream; the `account_id` partition key spreads load and avoids hot partitions in aggregate.
 4. The **PostgreSQL metadata** tier is bounded and small relative to the ledger; scale it with read replicas, and partition by `account_id` only if needed. The balance cache is refreshed by DynamoDB Streams consumers.
 5. Messaging scales by adding Kafka partitions; the workflow scales as stateless workers driven by the durable state.
@@ -569,8 +569,8 @@ The next bottleneck, connection count to PostgreSQL, is absorbed by RDS Proxy.
 
 ### Q8. How do you handle cancellation and reversals/refunds?
 **A.** Two cases, both append-only (existing `ledger_entries` are never mutated):
-- **Cancellation during the moratorium** (before `SETTLED`): the funds are still in escrow, so we append a `REVERSAL` pair (escrow → sender) and set `status=CANCELLED`. The recipient was never credited, so nothing to claw back.
-- **Post-settlement refund**: append a compensating `REVERSAL` pair (recipient → sender, via escrow) and set `status=REVERSED`.
+- **Cancellation during the moratorium** (before `SETTLED`): no money has moved — just **release the hold** (`held -= amount`) and set `status=CANCELLED`. No ledger entry, nothing to claw back.
+- **Post-settlement refund**: money has moved, so append a compensating **`REVERSAL`** `TransactWriteItems` (recipient `available -= amount` + DEBIT entry, sender `available += amount` + CREDIT entry) and set `status=REVERSED`.
 
 In both cases the immutable ledger preserves a complete audit trail, and `transfer_events` records who/what triggered the change.
 

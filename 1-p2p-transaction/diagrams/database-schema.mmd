@@ -1,9 +1,10 @@
 erDiagram
     USERS ||--o{ ACCOUNT_META : "owns"
     USERS ||--o{ USER_IDENTIFIERS : "has"
-    ACCOUNT_META ||..o{ LEDGER_DDB : "残高は最新エントリのbalance_after"
+    ACCOUNT_META ||..|| BALANCE_DDB : "正の残高はここ"
+    BALANCE_DDB ||..o{ LEDGER_DDB : "決済ごとにエントリ追記"
     TRANSFERS_META ||--o{ TRANSFER_EVENTS : "tracked by"
-    TRANSFERS_META ||..|{ LEDGER_DDB : "金額の真実 (>=2 entries)"
+    TRANSFERS_META ||..|{ LEDGER_DDB : "決済時に書く (>=2 entries)"
 
     USERS {
         uuid user_id PK
@@ -21,10 +22,9 @@ erDiagram
 
     ACCOUNT_META {
         uuid account_id PK
-        uuid user_id FK "システム勘定はnull"
-        string type "USER | ESCROW (clearing)"
-        bigint balance_cache_minor "表示用キャッシュのみ (正ではない)"
+        uuid user_id FK
         string currency "USD固定"
+        bigint balance_cache_minor "表示用キャッシュのみ (正ではない)"
         string note "[PostgreSQL — 非金額メタ + キャッシュ]"
     }
 
@@ -32,7 +32,8 @@ erDiagram
         uuid transfer_id PK
         uuid sender_account FK
         uuid recipient_account FK
-        string status "DEBITED|FRAUD_REVIEW|MORATORIUM|SETTLED|CANCELLED|REVERSED"
+        bigint amount_minor "(決済まで送金者にheldされる額)"
+        string status "DEBITED|FRAUD_REVIEW|MORATORIUM|SETTLED|CANCELLED"
         string idempotency_key UK "クライアント発行; 二重処理を防止"
         string note_text "ユーザーメモ, 検索可"
         timestamp created_at
@@ -49,14 +50,22 @@ erDiagram
         string note "[PostgreSQL — ワークフロー状態]"
     }
 
+    BALANCE_DDB {
+        string partition_key "ACCOUNT-id"
+        bigint available_minor "実残高 (SETTLE時に減算)"
+        bigint held_minor "処理中送金の保留額 (POST時に設定)"
+        bigint version "条件付き書込の楽観ロック"
+        string note "[DynamoDB — 正の残高; available - held = 利用可能]"
+    }
+
     LEDGER_DDB {
         string partition_key "ACCOUNT-id"
         bigint seq "ソートキー; 勘定ごとの連番"
         uuid entry_id "ユニーク"
         uuid transfer_id "GSI"
         string idempotency_key "二重処理ガード"
-        string phase "DEBIT_TO_ESCROW | ESCROW_TO_RECIPIENT | REVERSAL"
+        string type "DEBIT | CREDIT | REVERSAL"
         bigint amount_minor "符号付 (+credit / -debit)"
-        bigint balance_after "処理後残高 — これが現在残高"
-        string note "[DynamoDB — 台帳=金額の真実, 追記専用, 7年]"
+        bigint balance_after "決済後の利用可能残高スナップショット"
+        string note "[DynamoDB — SETTLE時のみ追記, 7年]"
     }

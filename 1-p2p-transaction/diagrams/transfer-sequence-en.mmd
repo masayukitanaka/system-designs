@@ -13,23 +13,21 @@ sequenceDiagram
     participant N as Notification
 
     rect rgb(225, 240, 255)
-    Note over C,MQ: SYNCHRONOUS — debit only, then return 200 and fire event
+    Note over C,MQ: SYNCHRONOUS — reserve (hold) only, NO money moved yet, return 200 + event
     C->>GW: POST /v1/transfers (Idempotency-Key, JWT)
     GW->>GW: JWT verify / rate limit
     GW->>P: createTransfer(req)
-    P->>PG: write transfers meta (status=DEBITED, note, idempotency_key)
+    P->>PG: write transfers meta (status=DEBITED, amount, note, idempotency_key)
     alt key exists (duplicate)
         PG-->>P: conflict → return stored response
         P-->>C: 200 (same as before)
     else new request
         P->>R: daily/per-txn limit check ($500 / $2,500)
         P->>U: resolve(email/phone) → recipientId
-        P->>DDB: read sender's latest ledger entry → balance_after, seq
-        Note over P,DDB: ONE DynamoDB TransactWriteItems (atomic, money truth)
-        P->>DDB: put sender entry (seq+1, balance_after-=amt) cond: seq+1 not exists
-        P->>DDB: put escrow entry (balance_after+=amt) cond: idempotency_key not seen
-        DDB-->>P: committed (or ConditionalCheckFailed → balance/replay → retry/dedupe)
-        P-->>C: 200 OK (transfer_id, status=DEBITED)
+        Note over P,DDB: reserve funds — conditional UpdateItem (no ledger entry, no escrow)
+        P->>DDB: sender balance: held += amount<br/>cond: available - held >= amount (else 422 insufficient)
+        DDB-->>P: OK (available unchanged — real money not moved yet)
+        P-->>C: 200 OK (transfer_id, status=DEBITED, display balance reduced)
         P->>MQ: TransferRequested
     end
     end
@@ -45,17 +43,18 @@ sequenceDiagram
     P->>F: fraud / AML check (suspicious merchant, etc.)
     F->>X: AML screening (+ ML scoring)
     X-->>F: result
-    alt denied / manual review needed
-        F-->>P: REVIEW or DENY
-        Note over P,DDB: rare: human approval flow → on DENY, compensate
-        P->>DDB: TransactWriteItems reverse: ESCROW → sender (phase=REVERSAL)
+    alt denied / cancelled during moratorium
+        F-->>P: REVIEW or DENY (or user cancels)
+        Note over P,DDB: just release the hold — no money ever moved
+        P->>DDB: sender balance: held -= amount
         P->>PG: transfers.status = CANCELLED
     else passed
         F-->>P: ALLOW
         Note over P: (2) moratorium — wait settle_after so the transfer can be cancelled
         P->>P: wait until settle_after (cancellable window)
-        Note over P,DDB: (3) settlement — actual transfer (DynamoDB TransactWriteItems)
-        P->>DDB: put escrow + recipient entries (phase=ESCROW_TO_RECIPIENT)<br/>each carries new balance_after, cond on latest seq + idempotency
+        Note over P,DDB: (3) SETTLEMENT — money actually moves now (one TransactWriteItems)
+        P->>DDB: sender: available -= amount, held -= amount + append DEBIT ledger entry
+        P->>DDB: recipient: available += amount + append CREDIT ledger entry<br/>cond: idempotency_key not settled
         P->>PG: transfers.status = SETTLED
         P->>MQ: TransferSettled
     end

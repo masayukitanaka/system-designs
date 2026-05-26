@@ -1,9 +1,10 @@
 erDiagram
     USERS ||--o{ ACCOUNT_META : "owns"
     USERS ||--o{ USER_IDENTIFIERS : "has"
-    ACCOUNT_META ||..o{ LEDGER_DDB : "balance is latest entry's balance_after"
+    ACCOUNT_META ||..|| BALANCE_DDB : "authoritative balance in"
+    BALANCE_DDB ||..o{ LEDGER_DDB : "each settled move appends entries"
     TRANSFERS_META ||--o{ TRANSFER_EVENTS : "tracked by"
-    TRANSFERS_META ||..|{ LEDGER_DDB : "money truth in (>=2 entries)"
+    TRANSFERS_META ||..|{ LEDGER_DDB : "settlement writes (>=2 entries)"
 
     USERS {
         uuid user_id PK
@@ -21,10 +22,9 @@ erDiagram
 
     ACCOUNT_META {
         uuid account_id PK
-        uuid user_id FK "null for system accounts"
-        string type "USER | ESCROW (clearing)"
-        bigint balance_cache_minor "DISPLAY CACHE ONLY (not authoritative)"
+        uuid user_id FK
         string currency "fixed to USD"
+        bigint balance_cache_minor "DISPLAY CACHE ONLY (not authoritative)"
         string note "[PostgreSQL — non-money metadata + cache]"
     }
 
@@ -32,7 +32,8 @@ erDiagram
         uuid transfer_id PK
         uuid sender_account FK
         uuid recipient_account FK
-        string status "DEBITED|FRAUD_REVIEW|MORATORIUM|SETTLED|CANCELLED|REVERSED"
+        bigint amount_minor "(also held against sender until settle)"
+        string status "DEBITED|FRAUD_REVIEW|MORATORIUM|SETTLED|CANCELLED"
         string idempotency_key UK "client-issued; blocks double-processing"
         string note_text "user memo, searchable"
         timestamp created_at
@@ -49,14 +50,22 @@ erDiagram
         string note "[PostgreSQL — workflow state]"
     }
 
+    BALANCE_DDB {
+        string partition_key "ACCOUNT-id"
+        bigint available_minor "real balance (decremented at SETTLE)"
+        bigint held_minor "reserved by in-flight transfers (set at POST)"
+        bigint version "optimistic lock for conditional writes"
+        string note "[DynamoDB — authoritative balance; available - held = spendable]"
+    }
+
     LEDGER_DDB {
         string partition_key "ACCOUNT-id"
         bigint seq "sort key; per-account sequence"
         uuid entry_id "unique"
         uuid transfer_id "GSI"
         string idempotency_key "guards double-processing"
-        string phase "DEBIT_TO_ESCROW | ESCROW_TO_RECIPIENT | REVERSAL"
+        string type "DEBIT | CREDIT | REVERSAL"
         bigint amount_minor "signed (+credit / -debit)"
-        bigint balance_after "post-txn balance — THIS IS THE CURRENT BALANCE"
-        string note "[DynamoDB — ledger = money truth, append-only, 7y]"
+        bigint balance_after "post-settlement available balance snapshot"
+        string note "[DynamoDB — append-only at SETTLE only, 7y]"
     }
