@@ -26,7 +26,7 @@ graph TB
     end
 
     subgraph Data["データ層"]
-        DDB[("<b>DynamoDB — 正 (金額)</b><br/>残高シャード + 全台帳 (約126億行/年)<br/>追記専用, 7年, account_id別<br/>TransactWriteItemsで原子的")]
+        DDB[("<b>DynamoDB — 正 (金額)</b><br/>全台帳 (約126億行/年), 追記専用, 7年, account_id別<br/>残高 = 最新エントリのbalance_after<br/>TransactWriteItems + 冪等ガードで原子的")]
         LEDGERDB[("PostgreSQL (Aurora)<br/>メタデータ: users / transfersメタ / events / idempotency<br/>+ 残高<i>表示キャッシュ</i> (正ではない)")]
         CACHE[("Redis<br/>キャッシュ / レート制限")]
         ARCHIVE[("S3 + Glacier<br/>監査長期保管 / DynamoDBエクスポート")]

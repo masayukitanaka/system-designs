@@ -24,12 +24,11 @@ sequenceDiagram
     else new request
         P->>R: daily/per-txn limit check ($500 / $2,500)
         P->>U: resolve(email/phone) → recipientId
+        P->>DDB: read sender's latest ledger entry → balance_after, seq
         Note over P,DDB: ONE DynamoDB TransactWriteItems (atomic, money truth)
-        P->>DDB: condition: sender balance shard >= amount (version check)
-        P->>DDB: debit sender shard, credit ESCROW shard
-        P->>DDB: put ledger entries (phase=DEBIT_TO_ESCROW)
-        P->>DDB: idempotency guard item (transfer_id)
-        DDB-->>P: committed (or ConditionalCheckFailed → reject/dedupe)
+        P->>DDB: put sender entry (seq+1, balance_after-=amt) cond: seq+1 not exists
+        P->>DDB: put escrow entry (balance_after+=amt) cond: idempotency_key not seen
+        DDB-->>P: committed (or ConditionalCheckFailed → balance/replay → retry/dedupe)
         P-->>C: 200 OK (transfer_id, status=DEBITED)
         P->>MQ: TransferRequested
     end
@@ -56,8 +55,7 @@ sequenceDiagram
         Note over P: (2) moratorium — wait settle_after so the transfer can be cancelled
         P->>P: wait until settle_after (cancellable window)
         Note over P,DDB: (3) settlement — actual transfer (DynamoDB TransactWriteItems)
-        P->>DDB: debit ESCROW shard, credit recipient shard
-        P->>DDB: put ledger entries (phase=ESCROW_TO_RECIPIENT)
+        P->>DDB: put escrow + recipient entries (phase=ESCROW_TO_RECIPIENT)<br/>each carries new balance_after, cond on latest seq + idempotency
         P->>PG: transfers.status = SETTLED
         P->>MQ: TransferSettled
     end

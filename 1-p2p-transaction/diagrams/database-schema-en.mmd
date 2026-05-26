@@ -1,11 +1,9 @@
 erDiagram
     USERS ||--o{ ACCOUNT_META : "owns"
     USERS ||--o{ USER_IDENTIFIERS : "has"
-    ACCOUNT_META ||..o{ BALANCE_SHARDS_DDB : "cached-by / authoritative-in"
-    TRANSFERS_META ||--o| IDEMPOTENCY_KEYS : "guarded by"
+    ACCOUNT_META ||..o{ LEDGER_DDB : "balance is latest entry's balance_after"
     TRANSFERS_META ||--o{ TRANSFER_EVENTS : "tracked by"
-    TRANSFERS_META ||..|{ LEDGER_DDB : "money truth in"
-    BALANCE_SHARDS_DDB ||--|{ LEDGER_DDB : "produces (>=2 entries)"
+    TRANSFERS_META ||..|{ LEDGER_DDB : "money truth in (>=2 entries)"
 
     USERS {
         uuid user_id PK
@@ -35,7 +33,7 @@ erDiagram
         uuid sender_account FK
         uuid recipient_account FK
         string status "DEBITED|FRAUD_REVIEW|MORATORIUM|SETTLED|CANCELLED|REVERSED"
-        string idempotency_key UK
+        string idempotency_key UK "client-issued; blocks double-processing"
         string note_text "user memo, searchable"
         timestamp created_at
         timestamp settle_after "moratorium expiry"
@@ -51,28 +49,14 @@ erDiagram
         string note "[PostgreSQL — workflow state]"
     }
 
-    IDEMPOTENCY_KEYS {
-        string key PK
-        string request_hash
-        string response_snapshot
-        string state "PROCESSING|SUCCESS|FAILED"
-        timestamp expires_at "TTL 24h"
-        string note "[PostgreSQL]"
-    }
-
-    BALANCE_SHARDS_DDB {
-        string partition_key "ACCOUNT-id-SHARD-n"
-        bigint balance_minor "AUTHORITATIVE balance (sharded)"
-        bigint version "optimistic / conditional write"
-        string note "[DynamoDB — money truth]"
-    }
-
     LEDGER_DDB {
         string partition_key "ACCOUNT-id"
-        string sort_key "ts-entry_id"
+        bigint seq "sort key; per-account sequence"
+        uuid entry_id "unique"
         uuid transfer_id "GSI"
+        string idempotency_key "guards double-processing"
         string phase "DEBIT_TO_ESCROW | ESCROW_TO_RECIPIENT | REVERSAL"
         bigint amount_minor "signed (+credit / -debit)"
-        bigint balance_after "running snapshot"
-        string note "[DynamoDB — full ledger, append-only, 7y]"
+        bigint balance_after "post-txn balance — THIS IS THE CURRENT BALANCE"
+        string note "[DynamoDB — ledger = money truth, append-only, 7y]"
     }

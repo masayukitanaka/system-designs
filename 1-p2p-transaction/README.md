@@ -265,7 +265,7 @@ This document progressively elaborates in the order "overview → design princip
 > **Important**: All monetary amounts are held as `bigint` (minor units such as cents) to eliminate rounding errors.
 
 > **Key sizing decision — polyglot persistence, DynamoDB for money**: ~12.6B ledger rows/year is **too much for PostgreSQL**, so the entire transaction/ledger system and balances live in **DynamoDB**, which scales horizontally for this volume. PostgreSQL holds only **non-money metadata** plus a balance **display cache**:
-> - **DynamoDB (source of truth for money)** — balances (held as **sharded balance items** for hot accounts) + the full `ledger_entries` (append-only, 7-year, partitioned by `account_id`). All money movement is an atomic **`TransactWriteItems`** (balance shards + ledger entries + idempotency guard in one transaction). Balance inquiries and history reads are served from here.
+> - **DynamoDB (source of truth for money)** — the full `ledger_entries` (append-only, 7-year, partitioned by `account_id`, sort key `seq`). **There is no separate balance record: each ledger entry stores the post-transaction `balance_after`, so the current balance is simply the latest entry's `balance_after`.** Money movement is an atomic **`TransactWriteItems`** that appends the balanced entries; double-processing is blocked by the client's **Idempotency-Key** (conditional `attribute_not_exists`).
 > - **PostgreSQL (metadata + cache)** — `users`, `user_identifiers`, `transfers` metadata (status, searchable memo), `transfer_events` (workflow state), `idempotency_keys`. It also keeps a **balance display cache** (`balance_cache_minor`) refreshed from **DynamoDB Streams** — *never* authoritative and *never* used for the debit decision.
 
 ---
@@ -360,8 +360,7 @@ Core services are deployed on **Amazon EKS** on AWS. Data stores (Aurora / Elast
 
 | Entity | Store | Role | Key Points |
 |--------|-------|------|------------|
-| **balance shards** | **DynamoDB** | Authoritative balance | Balance per account, kept as **N sharded items** (`ACCOUNT-id-SHARD-n`) for hot accounts; updated by conditional write (`version` + `balance >= amount`). **The source of truth for money** |
-| **ledger** | **DynamoDB** | Full double-entry ledger | All entries, append-only, 7-year. Partition key `account_id`, sort key `ts-entry_id`; GSI on `transfer_id`. ~12.6B rows/yr. Authoritative for **history/audit** |
+| **ledger** | **DynamoDB** | Full double-entry ledger **and** balance | All entries, append-only, 7-year. Partition key `account_id`, sort key `seq` (per-account sequence); GSI on `transfer_id`. Each entry carries `balance_after`, so **the current balance is the latest entry's `balance_after`** — no separate balance record. ~12.6B rows/yr. The source of truth for **money + history/audit** |
 | **users** | PostgreSQL | Users (KYC done) | Synced from upstream. Reference-centric metadata |
 | **user_identifiers** | PostgreSQL | Email/phone → userId | Unique index on `value`. Used for recipient resolution |
 | **accounts (meta)** | PostgreSQL | Account metadata + balance **cache** | `type` (USER / **ESCROW**), currency, etc. `balance_cache_minor` is a **display cache only** (refreshed from DynamoDB Streams), never authoritative, never used for the debit decision |
@@ -372,27 +371,24 @@ Core services are deployed on **Amazon EKS** on AWS. Data stores (Aurora / Elast
 #### Concept of the Double-Entry Ledger (with escrow)
 Because the recipient credit is **deferred** (async settlement after fraud + moratorium), money never vanishes in between: the synchronous step moves funds from the sender **into a system escrow (clearing) account**, and settlement later moves them from escrow to the recipient. Every phase is a **balanced pair that sums to zero**.
 
-Each phase is one **DynamoDB `TransactWriteItems`** that atomically updates the balance shards and appends the ledger entries:
+Each phase is one **DynamoDB `TransactWriteItems`** that appends the balanced ledger entries. Each entry records the running `balance_after`, computed from the previous latest entry — so **the balance is carried by the ledger itself**, not a separate item:
 
 ```
 Phase 1 (SYNC, at POST):   sender → escrow   [one TransactWriteItems]
-  - decrement sender balance shard   (condition: balance >= amount AND version matches)
-  - increment escrow balance shard
-  - put ledger entry (account=sender, amount=-1000, phase=DEBIT_TO_ESCROW)
-  - put ledger entry (account=escrow, amount=+1000, phase=DEBIT_TO_ESCROW)
-  - put idempotency guard item (condition: not exists)
+  read latest entry of sender (balance_after=B_s, seq=N_s) and escrow (B_e, N_e)
+  - put sender entry (seq=N_s+1, amount=-1000, balance_after=B_s-1000, phase=DEBIT_TO_ESCROW)
+        condition: no item at (sender, N_s+1)         ← optimistic lock on the latest entry
+  - put escrow entry (seq=N_e+1, amount=+1000, balance_after=B_e+1000, phase=DEBIT_TO_ESCROW)
+        condition: idempotency_key not already recorded ← blocks double-processing
 
 Phase 2 (ASYNC, at settlement):  escrow → recipient   [one TransactWriteItems]
-  - decrement escrow shard, increment recipient shard
-  - put ledger entries (phase=ESCROW_TO_RECIPIENT)
+  - put escrow + recipient entries (phase=ESCROW_TO_RECIPIENT), same conditions
 
   → Σ amount = 0 at every phase (conservation of funds; escrow nets to 0 once settled)
   Cancellation instead writes a REVERSAL TransactWriteItems (escrow → sender).
 ```
 
-**Where is the truth?** **Money lives in DynamoDB.** The authoritative balance is the sum of an account's balance shards in DynamoDB, mutated only via conditional `TransactWriteItems` (so a debit cannot overspend or double-apply). The DynamoDB ledger is the immutable system of record for history/audit. **PostgreSQL holds no authoritative money** — its `balance_cache_minor` is a display cache refreshed asynchronously from DynamoDB Streams and is never read for the debit decision. Reconciliation verifies that the sum of balance shards equals the running ledger total and that escrow equals the in-flight total. This is a deliberate **polyglot-persistence** split: DynamoDB for the massive, horizontally-scaled money store; PostgreSQL for rich relational metadata, search, and workflow state.
-
-> **Why shard the balance?** A single hot account (e.g. a popular merchant) would serialize on one DynamoDB item. Splitting the balance into N shards spreads concurrent debits/credits across N partition keys; the true balance is the sum of shards. Reads sum the shards; writes target one shard (credits any shard, debits pick a shard with sufficient funds or briefly consolidate).
+**Where is the truth?** **Money lives in DynamoDB, in the ledger.** Each ledger entry is one transaction and records the post-transaction `balance_after`; the current balance is read directly as the **latest entry's `balance_after`** (query the account partition, highest `seq`) — there is no separate balance record to keep in sync. Correctness comes from two conditions on the append: the `seq=N+1`-not-exists condition is an **optimistic lock** so two concurrent writes can't both chain off the same latest entry (the loser retries against the new latest), and the **Idempotency-Key** condition makes a retried request a no-op (no double debit). **PostgreSQL holds no authoritative money** — its `balance_cache_minor` is a display cache refreshed asynchronously from DynamoDB Streams and is never read for the debit decision. This is a deliberate **polyglot-persistence** split: DynamoDB for the massive, horizontally-scaled ledger; PostgreSQL for rich relational metadata, search, and workflow state.
 
 ### 4.2 Key Endpoints (API Contract)
 
@@ -439,7 +435,7 @@ The flow is deliberately split into a **short synchronous path** (so `POST /v1/t
 **Synchronous (`POST /v1/transfers` → 200 OK + event):**
 1. **Metadata + idempotency**: Write the `transfers` metadata row to PostgreSQL (unique constraint on `idempotency_key`); a duplicate conflicts and the stored response is returned.
 2. **Limit check** (e.g. $500/txn, $2,500/day) and **recipient resolution** happen here — cheap to reject early.
-3. **Debit only, into escrow — in DynamoDB**: One **`TransactWriteItems`** atomically decrements the sender balance shard (conditional: `balance >= amount` and `version` matches), increments the escrow shard, appends the two ledger entries (`phase=DEBIT_TO_ESCROW`), and writes the idempotency guard item. A `ConditionalCheckFailed` means insufficient funds or a replay → reject/dedupe. The recipient is **not** credited yet.
+3. **Debit only, into escrow — in DynamoDB**: Read the sender's and escrow's latest ledger entries (their `balance_after`, `seq`), then one **`TransactWriteItems`** appends the sender entry (`seq+1`, `balance_after-=amount`) and escrow entry (`seq+1`, `balance_after+=amount`), both `phase=DEBIT_TO_ESCROW`. Conditions: `seq+1` must not already exist (optimistic lock; also fails if `balance_after` would go negative → insufficient funds) and the Idempotency-Key must be unseen. `ConditionalCheckFailed` → retry against the new latest, or dedupe a replay. The recipient is **not** credited yet.
 4. Return `200 OK (status=DEBITED)` and publish `TransferRequested` to Kafka.
 
 **Asynchronous settlement workflow (state machine; AWS Step Functions if it grows complex):**
@@ -477,14 +473,14 @@ The flow is deliberately split into a **short synchronous path** (so `POST /v1/t
 
 ### 6.1 Latency (Target p99 ≤ 3 seconds)
 - **Minimize the synchronous path**: The synchronous request only does "idempotency check → limit check → recipient resolution → debit into escrow → return 200." Fraud/AML, the moratorium, settlement, and notifications are all moved to the async workflow, keeping the user-facing latency well under 3 seconds.
-- **Balance reads**: The authoritative balance is the sum of an account's DynamoDB balance shards (low-latency, strongly-consistent read when needed). The PostgreSQL `balance_cache_minor` may back fast UI display, but the **debit decision always reads/writes DynamoDB**, never the cache.
+- **Balance reads**: The authoritative balance is the **latest ledger entry's `balance_after`** — a single query on the account partition for the highest `seq` (low-latency, strongly-consistent when needed). The PostgreSQL `balance_cache_minor` may back fast UI display, but the **debit decision always reads/conditions on DynamoDB**, never the cache.
 - **Connection pooling**: Reuse PostgreSQL connections with RDS Proxy / PgBouncer; DynamoDB is accessed over HTTP with the SDK's connection reuse.
-- **Hot-account mitigation**: Balance sharding (sum of N shard items) spreads concurrent debits/credits for hot accounts across partition keys, avoiding a single-item bottleneck.
+- **Hot-account note**: Because each account's writes chain through `seq`, a single very hot account (e.g. a popular merchant) serializes its own writes. That is correct (its true running balance is inherently sequential); to scale such an account, see the sub-account option in §7.2.
 
 ### 6.2 Throughput & Scalability (200→1,000 TPS, future 10x)
 - **Stateless core services** + HPA for horizontal scaling. State is externalized to DB/Redis/Kafka.
-- **Polyglot storage**: All money (balance + ledger) is in **DynamoDB**, which scales horizontally for the ~12.6B rows/yr write/read volume; balance and history reads go there. PostgreSQL handles only bounded metadata/search/workflow, so the relational tier never carries the huge stream.
-- **Native partitioning**: DynamoDB partitions by `account_id` (balance shards add an extra shard suffix for hot accounts); PostgreSQL metadata is small and can be partitioned/sharded by `account_id` if ever needed (see Tunable Decisions below).
+- **Polyglot storage**: All money (the ledger, which carries balance) is in **DynamoDB**, which scales horizontally for the ~12.6B rows/yr write/read volume; balance and history reads go there. PostgreSQL handles only bounded metadata/search/workflow, so the relational tier never carries the huge stream.
+- **Native partitioning**: DynamoDB partitions the ledger by `account_id` (sort key `seq`), spreading load across accounts; PostgreSQL metadata is small and can be partitioned/sharded by `account_id` if ever needed (see Tunable Decisions below).
 - **Event-driven load leveling**: During bursts, the queue acts as a buffer, protecting downstream (e.g., notifications).
 
 ### 6.3 Availability (99.99%)
@@ -494,11 +490,11 @@ The flow is deliberately split into a **short synchronous path** (so `POST /v1/t
 - **Circuit breakers & timeouts**: Cut off + fall back so that latency in external APIs (ML/AML/bank) does not drag down the whole system.
 
 ### 6.4 Consistency & Reliability
-- **Atomic money movement in DynamoDB**: Balance-shard updates + ledger entries + the idempotency guard are one **`TransactWriteItems`** with conditional expressions (`balance >= amount`, `version` match, guard `attribute_not_exists`). This is the all-or-nothing money mutation — no partial debit/credit, no overspend, no double-apply.
-- **Cache is asynchronous, never authoritative**: The PostgreSQL `balance_cache_minor` is refreshed from **DynamoDB Streams** (eventually consistent). It is display-only; staleness can never cause a wrong debit because debits read/condition on DynamoDB.
-- **Cross-store metadata**: The `transfers` metadata write (PostgreSQL) and the money write (DynamoDB) are two stores; we order them so the metadata row (idempotency key) is written first, then the conditional DynamoDB transaction. A crash between them is reconciled by the workflow (a `DEBITED` metadata row with no matching ledger entry is retried or rolled back).
-- **Idempotent everywhere**: The DynamoDB transaction's guard item and the Kafka consumers' dedupe by `transfer_id` make retries safe.
-- **Continuous reconciliation**: A job verifies that the sum of an account's balance shards equals its running ledger total in DynamoDB, and that escrow equals the in-flight total; divergence raises an alert.
+- **Atomic money movement in DynamoDB**: The balanced ledger entries are appended in one **`TransactWriteItems`** with conditional expressions: the next-`seq`-not-exists condition prevents a lost update (overspend), and the `attribute_not_exists` on the Idempotency-Key blocks double-processing. `balance_after` is computed in the same write. All-or-nothing — no partial debit/credit, no overspend, no double-apply.
+- **Cache is asynchronous, never authoritative**: The PostgreSQL `balance_cache_minor` is refreshed from **DynamoDB Streams** (eventually consistent). It is display-only; staleness can never cause a wrong debit because debits read/condition on the DynamoDB ledger.
+- **Cross-store metadata**: The `transfers` metadata write (PostgreSQL) and the money write (DynamoDB) are two stores; we write the metadata row (with the idempotency key) first, then the conditional DynamoDB transaction. A crash between them is reconciled by the workflow (a `DEBITED` metadata row with no matching ledger entry is retried or rolled back).
+- **Idempotent everywhere**: The Idempotency-Key condition in the DynamoDB transaction and the Kafka consumers' dedupe by `transfer_id` make retries safe.
+- **Continuous reconciliation**: A job replays an account's ledger entries and checks that each `balance_after` chains correctly (prev + amount = next) and that escrow nets to the in-flight total; divergence raises an alert.
 
 ---
 
@@ -507,17 +503,17 @@ The flow is deliberately split into a **short synchronous path** (so `POST /v1/t
 This section presents points that can change depending on requirements, along with their trade-offs, making it clear that "there is no single right answer."
 
 ### 7.1 Polyglot Persistence: DynamoDB for money, PostgreSQL for metadata
-The volume (~12.6B ledger rows/year) rules out PostgreSQL for the ledger, so money (balance + ledger) lives in **DynamoDB**, and PostgreSQL keeps only metadata + a display cache:
+The volume (~12.6B ledger rows/year) rules out PostgreSQL for the ledger, so money (the ledger, which carries the balance) lives in **DynamoDB**, and PostgreSQL keeps only metadata + a display cache:
 
-| Aspect | DynamoDB (money: balance + ledger) | PostgreSQL (metadata + cache) |
+| Aspect | DynamoDB (money: ledger + balance) | PostgreSQL (metadata + cache) |
 |--------|------------------------------------|-------------------------------|
-| **Holds** | Authoritative balance (sharded) + full ledger, 7-year, append-only | users, transfers meta, workflow events, idempotency, **balance display cache** |
-| **Transactions** | `TransactWriteItems` (up to 25 items) — atomic balance + ledger + guard | Multi-row ACID for metadata (not money) |
-| **Scaling** | Near-unlimited horizontal scale; sharded balances avoid hot items | Bounded, small relational data; easy to operate |
-| **Consistency** | Strongly-consistent reads + conditional writes for the debit decision | The cache is eventually consistent (DynamoDB Streams); never authoritative |
+| **Holds** | Full ledger, 7-year, append-only; balance = latest entry's `balance_after` | users, transfers meta, workflow events, **balance display cache** |
+| **Transactions** | `TransactWriteItems` (up to 25 items) — atomic balanced entries + conditions | Multi-row ACID for metadata (not money) |
+| **Scaling** | Near-unlimited horizontal scale, partitioned by `account_id` | Bounded, small relational data; easy to operate |
+| **Consistency** | Strongly-consistent read of latest entry + conditional append for the debit | The cache is eventually consistent (DynamoDB Streams); never authoritative |
 | **Why** | Massive write throughput + cheap long-term retention for the ledger | Rich queries: search by memo, joins, workflow state, reporting |
 
-> Trade-off: putting money in DynamoDB means the **double-entry atomicity and overspend prevention must be expressed as conditional `TransactWriteItems`** (and hot accounts need balance sharding), rather than relying on familiar SQL `SERIALIZABLE`. We accept this because the ledger volume is infeasible for PostgreSQL, and DynamoDB's conditional transactions + sharding give both the scale and the correctness. The metadata/cache in PostgreSQL is eventually consistent with DynamoDB (via Streams), reconciled by a continuous job. **Alternatives**: (a) all-PostgreSQL with partitioning + S3 archival — simplest consistency story but the row volume is operationally infeasible; (b) money in PostgreSQL, history in DynamoDB (the previous iteration) — keeps SQL ACID for balances but still needs cross-store sync and caps balance scale at the relational Writer. Putting the whole money store in DynamoDB is the choice when ledger scale dominates.
+> Trade-off: putting money in DynamoDB means **overspend prevention and ordering must be expressed as conditional appends** (optimistic lock on the next `seq`) rather than SQL `SERIALIZABLE`, and per-account writes are serialized by the `seq` chain. We accept this because the ledger volume is infeasible for PostgreSQL, and the conditional `TransactWriteItems` gives both scale (across accounts) and correctness (within an account). The metadata/cache in PostgreSQL is eventually consistent with DynamoDB (via Streams), reconciled by a continuous job. **Alternatives**: (a) all-PostgreSQL with partitioning + S3 archival — simplest consistency story but the row volume is operationally infeasible; (b) money in PostgreSQL, history in DynamoDB (an earlier iteration) — keeps SQL ACID for balances but still needs cross-store sync and caps write scale at the relational Writer. Putting the whole ledger in DynamoDB is the choice when ledger scale dominates.
 
 ### 7.2 Other Tunable Points
 | Tunable axis | Option A | Option B | Trade-off |
@@ -525,6 +521,7 @@ The volume (~12.6B ledger rows/year) rules out PostgreSQL for the ledger, so mon
 | **Transfer confirmation** | Fully synchronous (immediate COMPLETED) | **Sync debit + async settle** (chosen) | Fully sync gives the simplest UX but leaves no room for fraud review / cancellation and couples settlement to request availability. We chose sync-debit-into-escrow + async settlement: the sender gets immediate authoritative feedback, while fraud/AML and a moratorium run off the critical path. Trade-off: the recipient sees funds after settlement, not instantly — acceptable given the moratorium/fraud requirements |
 | **Moratorium length** | 0 (settle immediately) | Minutes–hours | Longer window = more cancellation/fraud safety but slower perceived delivery. Tunable per risk tier (e.g. new recipient, large amount) via `settle_after` |
 | **Consistency model** | Strong consistency (balance/ledger in DynamoDB) | Eventual consistency (PG balance cache, notifications) | Money uses strongly-consistent conditional writes in DynamoDB. The PostgreSQL display cache and notifications are eventually consistent for availability (CAP trade-off) |
+| **Very hot account** | Single ledger per account (chosen) | Split into N **sub-accounts** | Because per-account writes serialize on the `seq` chain, an extremely hot account (a giant merchant) could become a write hotspot. If needed, model it as N sub-accounts (each its own ledger partition) and sum/route across them — adds routing + aggregation complexity, so apply only to the rare hotspot, not by default |
 | **Messaging** | Kafka (MSK) | SQS/SNS | Kafka = high throughput / strong reprocessing; SQS = simpler ops. Choose by scale |
 | **Fraud detection** | Inline only | Inline + ML | Latency vs detection accuracy. Use sync ML only for high-risk to balance both |
 | **Multi-region** | Single region (current, US-only) | Active/passive DR | Cost vs RTO/RPO. Initially single region + regional backups |
@@ -543,7 +540,7 @@ Centered on the deep-dive questions in Part 3, this section lists points likely 
 **A.** Require a client-generated `Idempotency-Key`. Two layers: (1) the PostgreSQL `transfers` metadata row has a **unique constraint** on `idempotency_key`, so a duplicate create conflicts and returns the prior response; (2) more importantly, the money mutation's **`TransactWriteItems` includes a guard item** keyed by `transfer_id`/phase with an `attribute_not_exists` condition — so even if the same transaction is retried, the conditional write fails (`ConditionalCheckFailed`) and the balance is debited exactly once. Idempotency thus protects the money write atomically inside DynamoDB, not just at the metadata layer. The stored request hash also lets us reject "the same key with a different body" as a conflict.
 
 ### Q3. If a balance read and update happen concurrently, how do you ensure consistency?
-**A.** The balance lives in DynamoDB and is mutated only by **conditional `TransactWriteItems`**: the debit carries a condition like `balance >= amount AND version = N` (optimistic concurrency). Two concurrent debits race on the condition — one succeeds and bumps `version`, the other gets `ConditionalCheckFailed` and retries against the fresh value, so there is no lost update or overspend (no TOCTOU, because the check and the write are the same atomic operation). The check is **never** done against the PostgreSQL cache. For hot accounts, balance sharding means concurrent operations usually hit different shard items and don't contend at all; a debit that needs more than one shard holds them together in the single transaction. Drift is impossible by construction, but a reconciliation job still verifies shard-sum = ledger total.
+**A.** The balance is carried by the ledger: each new entry records `balance_after`, computed from the account's current latest entry (`seq=N`, `balance_after=B`). The append writes the next entry at `seq=N+1` with a condition that **no item at `seq=N+1` already exists** (optimistic lock). Two concurrent debits both read `seq=N` and try to write `seq=N+1`; DynamoDB lets exactly one win, the other gets `ConditionalCheckFailed` and retries against the new latest (`seq=N+1`, recomputing `balance_after`). So there is no lost update and no overspend — the read-compute-append is effectively serialized per account, and the check and write are one atomic conditional operation (no TOCTOU). The balance is **never** read from the PostgreSQL cache for this decision. A reconciliation job replays the chain to confirm each `balance_after` is consistent.
 
 ### Q4. Where are the SPOFs (single points of failure), and how do you eliminate them?
 **A.**
@@ -556,11 +553,11 @@ Centered on the deep-dive questions in Part 3, this section lists points likely 
 - **External APIs**: Circuit breaker + timeout + fallback (e.g., if ML is down, degrade to rule-based judgment).
 
 ### Q5. If transaction volume increases 10x (~10,000 TPS), where is the bottleneck and how do you scale?
-**A.** Balance + ledger are in **DynamoDB**, which scales horizontally near-linearly, so the money store is not the first wall. The pressure points and countermeasures, incrementally:
-1. **Hot account contention** is the main risk — a single popular account would serialize on one balance item. Mitigate with **balance sharding** (N shard items per account, sum on read), increasing shard count for the hottest accounts.
+**A.** The ledger is in **DynamoDB**, partitioned by `account_id`, so aggregate throughput scales horizontally near-linearly — the money store is not the first wall. The pressure points and countermeasures, incrementally:
+1. **A single very hot account** is the main risk — its writes serialize on the per-account `seq` chain (correct, but a hotspot). If one account dominates, model it as N **sub-accounts** (each its own ledger partition) and route/aggregate across them (see §7.2). Most accounts never need this.
 2. Keep the synchronous path minimal (one `TransactWriteItems` debit-to-escrow); push fraud/moratorium/settlement/notify to the async workflow.
-3. Use **DynamoDB on-demand or auto-scaling** so capacity tracks the write stream; design partition keys (`account_id` + shard suffix) to avoid hot partitions.
-4. The **PostgreSQL metadata** tier is bounded and small relative to the ledger; scale it with read replicas, and partition by `account_id` only if needed. The balance cache is refreshed by DynamoDB Streams consumers, which scale by shard.
+3. Use **DynamoDB on-demand or auto-scaling** so capacity tracks the write stream; the `account_id` partition key spreads load and avoids hot partitions in aggregate.
+4. The **PostgreSQL metadata** tier is bounded and small relative to the ledger; scale it with read replicas, and partition by `account_id` only if needed. The balance cache is refreshed by DynamoDB Streams consumers.
 5. Messaging scales by adding Kafka partitions; the workflow scales as stateless workers driven by the durable state.
 The next bottleneck, connection count to PostgreSQL, is absorbed by RDS Proxy.
 

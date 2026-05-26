@@ -26,7 +26,7 @@ graph TB
     end
 
     subgraph Data["Data Layer"]
-        DDB[("<b>DynamoDB — source of truth (money)</b><br/>balance shards + full ledger (~12.6B rows/yr)<br/>append-only, 7-year, by account_id<br/>atomic via TransactWriteItems")]
+        DDB[("<b>DynamoDB — source of truth (money)</b><br/>full ledger (~12.6B rows/yr), append-only, 7-year, by account_id<br/>balance = latest entry's balance_after<br/>atomic via TransactWriteItems + idempotency guard")]
         LEDGERDB[("PostgreSQL (Aurora)<br/>metadata: users / transfers meta / events / idempotency<br/>+ balance <i>display cache</i> (NOT authoritative)")]
         CACHE[("Redis<br/>cache / rate limit")]
         ARCHIVE[("S3 + Glacier<br/>long-term audit / DynamoDB export")]

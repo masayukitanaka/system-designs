@@ -1,11 +1,9 @@
 erDiagram
     USERS ||--o{ ACCOUNT_META : "owns"
     USERS ||--o{ USER_IDENTIFIERS : "has"
-    ACCOUNT_META ||..o{ BALANCE_SHARDS_DDB : "キャッシュ / 正はDDB"
-    TRANSFERS_META ||--o| IDEMPOTENCY_KEYS : "guarded by"
+    ACCOUNT_META ||..o{ LEDGER_DDB : "残高は最新エントリのbalance_after"
     TRANSFERS_META ||--o{ TRANSFER_EVENTS : "tracked by"
-    TRANSFERS_META ||..|{ LEDGER_DDB : "金額の真実はDDB"
-    BALANCE_SHARDS_DDB ||--|{ LEDGER_DDB : "produces (>=2 entries)"
+    TRANSFERS_META ||..|{ LEDGER_DDB : "金額の真実 (>=2 entries)"
 
     USERS {
         uuid user_id PK
@@ -35,7 +33,7 @@ erDiagram
         uuid sender_account FK
         uuid recipient_account FK
         string status "DEBITED|FRAUD_REVIEW|MORATORIUM|SETTLED|CANCELLED|REVERSED"
-        string idempotency_key UK
+        string idempotency_key UK "クライアント発行; 二重処理を防止"
         string note_text "ユーザーメモ, 検索可"
         timestamp created_at
         timestamp settle_after "モラトリアム満了"
@@ -51,28 +49,14 @@ erDiagram
         string note "[PostgreSQL — ワークフロー状態]"
     }
 
-    IDEMPOTENCY_KEYS {
-        string key PK
-        string request_hash
-        string response_snapshot
-        string state "PROCESSING|SUCCESS|FAILED"
-        timestamp expires_at "TTL 24h"
-        string note "[PostgreSQL]"
-    }
-
-    BALANCE_SHARDS_DDB {
-        string partition_key "ACCOUNT-id-SHARD-n"
-        bigint balance_minor "正の残高 (シャード化)"
-        bigint version "楽観 / 条件付き書込"
-        string note "[DynamoDB — 金額の真実]"
-    }
-
     LEDGER_DDB {
         string partition_key "ACCOUNT-id"
-        string sort_key "ts-entry_id"
+        bigint seq "ソートキー; 勘定ごとの連番"
+        uuid entry_id "ユニーク"
         uuid transfer_id "GSI"
+        string idempotency_key "二重処理ガード"
         string phase "DEBIT_TO_ESCROW | ESCROW_TO_RECIPIENT | REVERSAL"
         bigint amount_minor "符号付 (+credit / -debit)"
-        bigint balance_after "実行時スナップショット"
-        string note "[DynamoDB — 全台帳, 追記専用, 7年]"
+        bigint balance_after "処理後残高 — これが現在残高"
+        string note "[DynamoDB — 台帳=金額の真実, 追記専用, 7年]"
     }

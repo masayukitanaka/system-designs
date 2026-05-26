@@ -24,12 +24,11 @@ sequenceDiagram
     else 新規リクエスト
         P->>R: 日次/取引限度チェック ($500 / $2,500)
         P->>U: resolve(email/phone) → recipientId
+        P->>DDB: 送金者の最新台帳エントリを読む → balance_after, seq
         Note over P,DDB: 単一 DynamoDB TransactWriteItems (原子的, 金額の真実)
-        P->>DDB: 条件: 送金者残高シャード >= 金額 (versionチェック)
-        P->>DDB: 送金者シャードをdebit, ESCROWシャードをcredit
-        P->>DDB: 台帳エントリをput (phase=DEBIT_TO_ESCROW)
-        P->>DDB: 冪等性ガードアイテム (transfer_id)
-        DDB-->>P: コミット (または ConditionalCheckFailed → 拒否/重複排除)
+        P->>DDB: 送金者エントリput (seq+1, balance_after-=金額) 条件:seq+1未存在
+        P->>DDB: エスクローエントリput (balance_after+=金額) 条件:idempotency_key未使用
+        DDB-->>P: コミット (または ConditionalCheckFailed → 残高不足/再送 → 再試行/重複排除)
         P-->>C: 200 OK (transfer_id, status=DEBITED)
         P->>MQ: TransferRequested
     end
@@ -56,8 +55,7 @@ sequenceDiagram
         Note over P: (2) モラトリアム — settle_after まで待機し取消可能にする
         P->>P: settle_after まで待機 (取消可能な期間)
         Note over P,DDB: (3) トランザクション — 実際の振込 (DynamoDB TransactWriteItems)
-        P->>DDB: ESCROWシャードをdebit, 受取人シャードをcredit
-        P->>DDB: 台帳エントリをput (phase=ESCROW_TO_RECIPIENT)
+        P->>DDB: エスクロー+受取人エントリput (phase=ESCROW_TO_RECIPIENT)<br/>各々が新しいbalance_afterを持つ・最新seq+冪等で条件付き
         P->>PG: transfers.status = SETTLED
         P->>MQ: TransferSettled
     end
