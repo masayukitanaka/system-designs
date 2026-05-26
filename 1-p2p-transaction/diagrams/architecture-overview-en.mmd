@@ -1,0 +1,68 @@
+graph TB
+    subgraph Client["Client Layer"]
+        MOBILE["Mobile App / Web"]
+    end
+
+    subgraph Edge["Edge Layer"]
+        CDN["CloudFront (CDN)"]
+        WAF["AWS WAF"]
+        APIGW["API Gateway / ALB"]
+    end
+
+    subgraph Upstream["Upstream Services (out of scope)"]
+        AUTH["Auth Service<br/>(JWT issuance / KYC done)"]
+    end
+
+    subgraph Core["Core Services (scope of this design)"]
+        TRANSFER["Transfer Service<br/>transfer orchestration"]
+        ACCOUNT["Account/Ledger Service<br/>balance & ledger management"]
+        USER["User Directory Service<br/>phone/email → userId resolution"]
+        TXHIST["Transaction History Service<br/>history query (CQRS Read)"]
+        NOTIFY["Notification Service<br/>Push / SMS / Email"]
+        FRAUD["Fraud Rule Engine<br/>inline rule checks"]
+    end
+
+    subgraph Async["Async Infrastructure"]
+        MQ["Kafka / SQS<br/>event bus"]
+    end
+
+    subgraph Data["Data Layer"]
+        LEDGERDB[("PostgreSQL<br/>Ledger / Accounts<br/>(Aurora, strong consistency)")]
+        TXDB[("Transaction History Store<br/>(read-optimized / 7-year retention)")]
+        CACHE[("Redis<br/>balance cache / idempotency key / rate limit")]
+        ARCHIVE[("S3 + Glacier<br/>long-term audit log storage")]
+    end
+
+    subgraph External["External Integrations"]
+        ML["ML Fraud Scoring API"]
+        AML["AML Screening API"]
+        BANK["Bank/Payment Network<br/>(RTP / FedNow)"]
+    end
+
+    MOBILE --> CDN --> WAF --> APIGW
+    APIGW -->|JWT verify| AUTH
+    APIGW --> TRANSFER
+    APIGW --> TXHIST
+    APIGW --> ACCOUNT
+
+    TRANSFER --> USER
+    TRANSFER --> FRAUD
+    TRANSFER --> ACCOUNT
+    TRANSFER -->|high risk| ML
+    TRANSFER --> AML
+    TRANSFER --> BANK
+    TRANSFER --> MQ
+
+    ACCOUNT --> LEDGERDB
+    ACCOUNT --> CACHE
+    MQ --> TXHIST
+    MQ --> NOTIFY
+    TXHIST --> TXDB
+    LEDGERDB -.CDC.-> ARCHIVE
+
+    classDef scope fill:#e3f2fd,stroke:#1565c0,stroke-width:2px;
+    classDef ext fill:#fff3e0,stroke:#e65100,stroke-width:1px;
+    classDef data fill:#f1f8e9,stroke:#33691e,stroke-width:1px;
+    class TRANSFER,ACCOUNT,USER,TXHIST,NOTIFY,FRAUD scope;
+    class ML,AML,BANK,AUTH ext;
+    class LEDGERDB,TXDB,CACHE,ARCHIVE data;

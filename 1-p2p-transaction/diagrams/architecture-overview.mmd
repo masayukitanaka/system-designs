@@ -1,0 +1,68 @@
+graph TB
+    subgraph Client["クライアント層"]
+        MOBILE["モバイルアプリ / Web"]
+    end
+
+    subgraph Edge["エッジ層"]
+        CDN["CloudFront (CDN)"]
+        WAF["AWS WAF"]
+        APIGW["API Gateway / ALB"]
+    end
+
+    subgraph Upstream["上流サービス (スコープ外)"]
+        AUTH["認証サービス<br/>(JWT発行 / KYC済)"]
+    end
+
+    subgraph Core["コアサービス (本設計のスコープ)"]
+        TRANSFER["Transfer Service<br/>送金オーケストレーション"]
+        ACCOUNT["Account/Ledger Service<br/>残高・台帳管理"]
+        USER["User Directory Service<br/>電話/Email → userId 解決"]
+        TXHIST["Transaction History Service<br/>履歴照会 (CQRS Read)"]
+        NOTIFY["Notification Service<br/>Push / SMS / Email"]
+        FRAUD["Fraud Rule Engine<br/>インライン ルールチェック"]
+    end
+
+    subgraph Async["非同期基盤"]
+        MQ["Kafka / SQS<br/>イベントバス"]
+    end
+
+    subgraph Data["データ層"]
+        LEDGERDB[("PostgreSQL<br/>Ledger / Accounts<br/>(Aurora, 強整合)")]
+        TXDB[("取引履歴 Store<br/>(読取最適化 / 7年保持)")]
+        CACHE[("Redis<br/>残高キャッシュ / 冪等キー / レート制限")]
+        ARCHIVE[("S3 + Glacier<br/>監査ログ長期保管")]
+    end
+
+    subgraph External["外部連携"]
+        ML["ML 不正スコアリング API"]
+        AML["AML スクリーニング API"]
+        BANK["銀行/決済ネットワーク<br/>(RTP / FedNow)"]
+    end
+
+    MOBILE --> CDN --> WAF --> APIGW
+    APIGW -->|JWT検証| AUTH
+    APIGW --> TRANSFER
+    APIGW --> TXHIST
+    APIGW --> ACCOUNT
+
+    TRANSFER --> USER
+    TRANSFER --> FRAUD
+    TRANSFER --> ACCOUNT
+    TRANSFER -->|高リスク時| ML
+    TRANSFER --> AML
+    TRANSFER --> BANK
+    TRANSFER --> MQ
+
+    ACCOUNT --> LEDGERDB
+    ACCOUNT --> CACHE
+    MQ --> TXHIST
+    MQ --> NOTIFY
+    TXHIST --> TXDB
+    LEDGERDB -.CDC.-> ARCHIVE
+
+    classDef scope fill:#e3f2fd,stroke:#1565c0,stroke-width:2px;
+    classDef ext fill:#fff3e0,stroke:#e65100,stroke-width:1px;
+    classDef data fill:#f1f8e9,stroke:#33691e,stroke-width:1px;
+    class TRANSFER,ACCOUNT,USER,TXHIST,NOTIFY,FRAUD scope;
+    class ML,AML,BANK,AUTH ext;
+    class LEDGERDB,TXDB,CACHE,ARCHIVE data;

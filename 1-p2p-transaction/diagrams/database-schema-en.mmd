@@ -1,0 +1,53 @@
+erDiagram
+    USERS ||--o{ ACCOUNTS : "owns"
+    USERS ||--o{ USER_IDENTIFIERS : "has"
+    ACCOUNTS ||--o{ LEDGER_ENTRIES : "records"
+    TRANSFERS ||--|{ LEDGER_ENTRIES : "produces (2 entries)"
+    TRANSFERS ||--o| IDEMPOTENCY_KEYS : "guarded by"
+
+    USERS {
+        uuid user_id PK
+        string status "KYC done (upstream)"
+        timestamp created_at
+    }
+
+    USER_IDENTIFIERS {
+        uuid user_id FK
+        string type "EMAIL | PHONE"
+        string value UK "resolution key (indexed)"
+    }
+
+    ACCOUNTS {
+        uuid account_id PK
+        uuid user_id FK
+        bigint balance_minor "balance (in cents)"
+        bigint version "optimistic lock"
+        string currency "fixed to USD"
+    }
+
+    TRANSFERS {
+        uuid transfer_id PK
+        uuid sender_account FK
+        uuid recipient_account FK
+        bigint amount_minor
+        string status "PENDING|COMPLETED|FAILED|REVERSED"
+        string idempotency_key UK
+        timestamp created_at
+    }
+
+    LEDGER_ENTRIES {
+        uuid entry_id PK
+        uuid transfer_id FK
+        uuid account_id FK
+        bigint amount_minor "signed (+credit / -debit)"
+        bigint balance_after "snapshot for audit"
+        timestamp created_at "append-only / immutable"
+    }
+
+    IDEMPOTENCY_KEYS {
+        string key PK
+        string request_hash
+        string response_snapshot
+        string state "PROCESSING|SUCCESS|FAILED"
+        timestamp expires_at "TTL 24h"
+    }

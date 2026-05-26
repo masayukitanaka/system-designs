@@ -1,0 +1,60 @@
+graph TB
+    subgraph Internet["Internet"]
+        U["Client"]
+    end
+
+    subgraph AWS["AWS Region (Multi-AZ)"]
+        R53["Route 53"]
+        WAFCF["CloudFront + WAF"]
+
+        subgraph EKS["Amazon EKS Cluster"]
+            ING["Ingress Controller<br/>(ALB Ingress / NGINX)"]
+
+            subgraph NSCore["Namespace: core"]
+                direction LR
+                TPOD["transfer-svc<br/>Deployment x N<br/>(HPA: CPU/TPS)"]
+                APOD["account-svc<br/>Deployment x N"]
+                HPOD["history-svc<br/>Deployment x N"]
+                NPOD["notify-svc<br/>Deployment x N"]
+            end
+
+            subgraph NSMesh["Service Mesh / Shared"]
+                MESH["Istio / App Mesh<br/>mTLS, retries, circuit breaking"]
+                ESO["External Secrets Operator<br/>→ AWS Secrets Manager"]
+            end
+
+            subgraph NSObs["Namespace: observability"]
+                PROM["Prometheus"]
+                OTEL["OTel Collector"]
+                FLUENT["Fluent Bit"]
+            end
+        end
+
+        subgraph Managed["Managed Data Services (outside cluster)"]
+            AURORA[("Aurora PostgreSQL<br/>Writer + Reader x2")]
+            REDIS[("ElastiCache Redis<br/>(cluster mode)")]
+            MSK["MSK (Kafka)"]
+            S3B["S3 / Glacier"]
+        end
+    end
+
+    U --> R53 --> WAFCF --> ING
+    ING --> TPOD & APOD & HPOD
+    TPOD -.mTLS.- MESH
+    APOD --> AURORA
+    APOD --> REDIS
+    TPOD --> MSK
+    MSK --> NPOD & HPOD
+    HPOD --> AURORA
+    ESO -.inject secrets.-> TPOD & APOD
+    TPOD & APOD & HPOD --> OTEL
+    OTEL --> PROM
+    TPOD & APOD --> FLUENT
+    AURORA -.snapshot.-> S3B
+
+    classDef pod fill:#e3f2fd,stroke:#1565c0,stroke-width:1px;
+    classDef infra fill:#ede7f6,stroke:#4527a0,stroke-width:1px;
+    classDef data fill:#f1f8e9,stroke:#33691e,stroke-width:1px;
+    class TPOD,APOD,HPOD,NPOD pod;
+    class MESH,ESO,PROM,OTEL,FLUENT,ING infra;
+    class AURORA,REDIS,MSK,S3B data;

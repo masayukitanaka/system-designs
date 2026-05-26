@@ -1,0 +1,45 @@
+sequenceDiagram
+    autonumber
+    participant C as クライアント
+    participant GW as API Gateway
+    participant T as Transfer Service
+    participant R as Redis (冪等/制限)
+    participant U as User Directory
+    participant F as Fraud Engine
+    participant A as Account/Ledger Service
+    participant DB as Ledger DB (Aurora)
+    participant MQ as Event Bus (Kafka)
+    participant N as Notification
+
+    C->>GW: POST /transfers (Idempotency-Key, JWT)
+    GW->>GW: JWT検証 / レート制限
+    GW->>T: createTransfer(req)
+
+    T->>R: SETNX idem:{key} = PROCESSING
+    alt キー既存 (重複リクエスト)
+        R-->>T: 既存の結果を返却
+        T-->>C: 200 (前回と同一レスポンス)
+    else 新規リクエスト
+        R-->>T: OK (ロック取得)
+        T->>U: resolve(email/phone) → recipientId
+        T->>R: 日次/取引限度チェック ($500 / $2,500)
+        T->>F: 不正ルール評価 (同期)
+        alt 高リスク
+            F-->>T: REVIEW/DENY
+            T-->>C: 422 (要レビュー)
+        else 許可
+            F-->>T: ALLOW
+            T->>A: executeTransfer(from,to,amount,txnId)
+            A->>DB: BEGIN (SERIALIZABLE)
+            A->>DB: 残高チェック + 二重仕訳 (debit/credit)
+            A->>DB: ledger_entries に追記 (immutable)
+            A->>DB: COMMIT
+            DB-->>A: OK
+            A-->>T: SUCCESS
+            T->>R: SET idem:{key} = SUCCESS(result)
+            T->>MQ: publish TransferCompleted
+            T-->>C: 201 Created (txnId, status=COMPLETED)
+            MQ-->>N: 受取人へ通知 (Push/SMS)
+            MQ-->>A: (履歴サービスへ非同期反映)
+        end
+    end

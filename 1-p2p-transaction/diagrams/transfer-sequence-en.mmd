@@ -1,0 +1,45 @@
+sequenceDiagram
+    autonumber
+    participant C as Client
+    participant GW as API Gateway
+    participant T as Transfer Service
+    participant R as Redis (idem/limit)
+    participant U as User Directory
+    participant F as Fraud Engine
+    participant A as Account/Ledger Service
+    participant DB as Ledger DB (Aurora)
+    participant MQ as Event Bus (Kafka)
+    participant N as Notification
+
+    C->>GW: POST /transfers (Idempotency-Key, JWT)
+    GW->>GW: JWT verify / rate limit
+    GW->>T: createTransfer(req)
+
+    T->>R: SETNX idem:{key} = PROCESSING
+    alt key exists (duplicate request)
+        R-->>T: return existing result
+        T-->>C: 200 (same response as before)
+    else new request
+        R-->>T: OK (lock acquired)
+        T->>U: resolve(email/phone) → recipientId
+        T->>R: daily/per-txn limit check ($500 / $2,500)
+        T->>F: fraud rule evaluation (sync)
+        alt high risk
+            F-->>T: REVIEW/DENY
+            T-->>C: 422 (review required)
+        else allow
+            F-->>T: ALLOW
+            T->>A: executeTransfer(from,to,amount,txnId)
+            A->>DB: BEGIN (SERIALIZABLE)
+            A->>DB: balance check + double-entry (debit/credit)
+            A->>DB: append to ledger_entries (immutable)
+            A->>DB: COMMIT
+            DB-->>A: OK
+            A-->>T: SUCCESS
+            T->>R: SET idem:{key} = SUCCESS(result)
+            T->>MQ: publish TransferCompleted
+            T-->>C: 201 Created (txnId, status=COMPLETED)
+            MQ-->>N: notify recipient (Push/SMS)
+            MQ-->>A: (async reflection to history service)
+        end
+    end
