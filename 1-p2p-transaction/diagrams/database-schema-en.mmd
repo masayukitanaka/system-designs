@@ -1,47 +1,54 @@
 erDiagram
-    USERS ||--o{ ACCOUNTS : "owns"
+    USERS ||--o{ ACCOUNT_META : "owns"
     USERS ||--o{ USER_IDENTIFIERS : "has"
-    ACCOUNTS ||--o{ LEDGER_ENTRIES : "records"
-    TRANSFERS ||--|{ LEDGER_ENTRIES : "produces (2 entries)"
-    TRANSFERS ||--o| IDEMPOTENCY_KEYS : "guarded by"
+    ACCOUNT_META ||..o{ BALANCE_SHARDS_DDB : "cached-by / authoritative-in"
+    TRANSFERS_META ||--o| IDEMPOTENCY_KEYS : "guarded by"
+    TRANSFERS_META ||--o{ TRANSFER_EVENTS : "tracked by"
+    TRANSFERS_META ||..|{ LEDGER_DDB : "money truth in"
+    BALANCE_SHARDS_DDB ||--|{ LEDGER_DDB : "produces (>=2 entries)"
 
     USERS {
         uuid user_id PK
         string status "KYC done (upstream)"
         timestamp created_at
+        string note "[PostgreSQL — metadata]"
     }
 
     USER_IDENTIFIERS {
         uuid user_id FK
         string type "EMAIL | PHONE"
         string value UK "resolution key (indexed)"
+        string note "[PostgreSQL — metadata]"
     }
 
-    ACCOUNTS {
+    ACCOUNT_META {
         uuid account_id PK
-        uuid user_id FK
-        bigint balance_minor "balance (in cents)"
-        bigint version "optimistic lock"
+        uuid user_id FK "null for system accounts"
+        string type "USER | ESCROW (clearing)"
+        bigint balance_cache_minor "DISPLAY CACHE ONLY (not authoritative)"
         string currency "fixed to USD"
+        string note "[PostgreSQL — non-money metadata + cache]"
     }
 
-    TRANSFERS {
+    TRANSFERS_META {
         uuid transfer_id PK
         uuid sender_account FK
         uuid recipient_account FK
-        bigint amount_minor
-        string status "PENDING|COMPLETED|FAILED|REVERSED"
+        string status "DEBITED|FRAUD_REVIEW|MORATORIUM|SETTLED|CANCELLED|REVERSED"
         string idempotency_key UK
+        string note_text "user memo, searchable"
         timestamp created_at
+        timestamp settle_after "moratorium expiry"
+        string note "[PostgreSQL — metadata/search/workflow]"
     }
 
-    LEDGER_ENTRIES {
-        uuid entry_id PK
+    TRANSFER_EVENTS {
+        uuid event_id PK
         uuid transfer_id FK
-        uuid account_id FK
-        bigint amount_minor "signed (+credit / -debit)"
-        bigint balance_after "snapshot for audit"
-        timestamp created_at "append-only / immutable"
+        string step "FRAUD|MORATORIUM|SETTLE|NOTIFY"
+        string state "PENDING|DONE|FAILED|MANUAL_REVIEW"
+        timestamp created_at
+        string note "[PostgreSQL — workflow state]"
     }
 
     IDEMPOTENCY_KEYS {
@@ -50,4 +57,22 @@ erDiagram
         string response_snapshot
         string state "PROCESSING|SUCCESS|FAILED"
         timestamp expires_at "TTL 24h"
+        string note "[PostgreSQL]"
+    }
+
+    BALANCE_SHARDS_DDB {
+        string partition_key "ACCOUNT-id-SHARD-n"
+        bigint balance_minor "AUTHORITATIVE balance (sharded)"
+        bigint version "optimistic / conditional write"
+        string note "[DynamoDB — money truth]"
+    }
+
+    LEDGER_DDB {
+        string partition_key "ACCOUNT-id"
+        string sort_key "ts-entry_id"
+        uuid transfer_id "GSI"
+        string phase "DEBIT_TO_ESCROW | ESCROW_TO_RECIPIENT | REVERSAL"
+        bigint amount_minor "signed (+credit / -debit)"
+        bigint balance_after "running snapshot"
+        string note "[DynamoDB — full ledger, append-only, 7y]"
     }

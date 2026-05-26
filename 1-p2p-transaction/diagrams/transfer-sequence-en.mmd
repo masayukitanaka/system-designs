@@ -2,44 +2,64 @@ sequenceDiagram
     autonumber
     participant C as Client
     participant GW as API Gateway
-    participant T as Transfer Service
-    participant R as Redis (idem/limit)
+    participant P as Payments Service
+    participant R as Redis (rate limit)
+    participant DDB as DynamoDB (balance + ledger — money truth)
+    participant PG as PostgreSQL (metadata + balance cache)
+    participant MQ as Event Bus (Kafka)
     participant U as User Directory
     participant F as Fraud Engine
-    participant A as Account/Ledger Service
-    participant DB as Ledger DB (Aurora)
-    participant MQ as Event Bus (Kafka)
+    participant X as ML / AML APIs (external)
     participant N as Notification
 
-    C->>GW: POST /transfers (Idempotency-Key, JWT)
+    rect rgb(225, 240, 255)
+    Note over C,MQ: SYNCHRONOUS — debit only, then return 200 and fire event
+    C->>GW: POST /v1/transfers (Idempotency-Key, JWT)
     GW->>GW: JWT verify / rate limit
-    GW->>T: createTransfer(req)
-
-    T->>R: SETNX idem:{key} = PROCESSING
-    alt key exists (duplicate request)
-        R-->>T: return existing result
-        T-->>C: 200 (same response as before)
+    GW->>P: createTransfer(req)
+    P->>PG: write transfers meta (status=DEBITED, note, idempotency_key)
+    alt key exists (duplicate)
+        PG-->>P: conflict → return stored response
+        P-->>C: 200 (same as before)
     else new request
-        R-->>T: OK (lock acquired)
-        T->>U: resolve(email/phone) → recipientId
-        T->>R: daily/per-txn limit check ($500 / $2,500)
-        T->>F: fraud rule evaluation (sync)
-        alt high risk
-            F-->>T: REVIEW/DENY
-            T-->>C: 422 (review required)
-        else allow
-            F-->>T: ALLOW
-            T->>A: executeTransfer(from,to,amount,txnId)
-            A->>DB: BEGIN (SERIALIZABLE)
-            A->>DB: balance check + double-entry (debit/credit)
-            A->>DB: append to ledger_entries (immutable)
-            A->>DB: COMMIT
-            DB-->>A: OK
-            A-->>T: SUCCESS
-            T->>R: SET idem:{key} = SUCCESS(result)
-            T->>MQ: publish TransferCompleted
-            T-->>C: 201 Created (txnId, status=COMPLETED)
-            MQ-->>N: notify recipient (Push/SMS)
-            MQ-->>A: (async reflection to history service)
-        end
+        P->>R: daily/per-txn limit check ($500 / $2,500)
+        P->>U: resolve(email/phone) → recipientId
+        Note over P,DDB: ONE DynamoDB TransactWriteItems (atomic, money truth)
+        P->>DDB: condition: sender balance shard >= amount (version check)
+        P->>DDB: debit sender shard, credit ESCROW shard
+        P->>DDB: put ledger entries (phase=DEBIT_TO_ESCROW)
+        P->>DDB: idempotency guard item (transfer_id)
+        DDB-->>P: committed (or ConditionalCheckFailed → reject/dedupe)
+        P-->>C: 200 OK (transfer_id, status=DEBITED)
+        P->>MQ: TransferRequested
+    end
+    end
+
+    rect rgb(255, 248, 225)
+    Note over DDB,PG: DynamoDB Streams → refresh PostgreSQL balance cache (async, display only)
+    DDB-->>PG: stream balance change → update balance_cache_minor
+    end
+
+    rect rgb(235, 255, 235)
+    Note over MQ,N: ASYNCHRONOUS WORKFLOW (state machine — Step Functions if it grows complex)
+    MQ-->>P: (1) fraud step
+    P->>F: fraud / AML check (suspicious merchant, etc.)
+    F->>X: AML screening (+ ML scoring)
+    X-->>F: result
+    alt denied / manual review needed
+        F-->>P: REVIEW or DENY
+        Note over P,DDB: rare: human approval flow → on DENY, compensate
+        P->>DDB: TransactWriteItems reverse: ESCROW → sender (phase=REVERSAL)
+        P->>PG: transfers.status = CANCELLED
+    else passed
+        F-->>P: ALLOW
+        Note over P: (2) moratorium — wait settle_after so the transfer can be cancelled
+        P->>P: wait until settle_after (cancellable window)
+        Note over P,DDB: (3) settlement — actual transfer (DynamoDB TransactWriteItems)
+        P->>DDB: debit ESCROW shard, credit recipient shard
+        P->>DDB: put ledger entries (phase=ESCROW_TO_RECIPIENT)
+        P->>PG: transfers.status = SETTLED
+        P->>MQ: TransferSettled
+    end
+    MQ-->>N: (4) notify sender & recipient (Push/SMS/Email)
     end

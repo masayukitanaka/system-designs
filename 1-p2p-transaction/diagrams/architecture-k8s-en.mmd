@@ -12,9 +12,9 @@ graph TB
 
             subgraph NSCore["Namespace: core"]
                 direction LR
-                TPOD["transfer-svc<br/>Deployment x N<br/>(HPA: CPU/TPS)"]
-                APOD["account-svc<br/>Deployment x N"]
-                HPOD["history-svc<br/>Deployment x N"]
+                TPOD["payments-svc<br/>Deployment x N<br/>(HPA: CPU/TPS)<br/>transfer+ledger+history"]
+                FPOD["fraud-svc<br/>Deployment x N"]
+                UPOD["user-svc<br/>Deployment x N"]
                 NPOD["notify-svc<br/>Deployment x N"]
             end
 
@@ -31,7 +31,8 @@ graph TB
         end
 
         subgraph Managed["Managed Data Services (outside cluster)"]
-            AURORA[("Aurora PostgreSQL<br/>Writer + Reader x2")]
+            DDB[("DynamoDB<br/>balance + full ledger<br/>(money source of truth)")]
+            AURORA[("Aurora PostgreSQL<br/>metadata + balance cache")]
             REDIS[("ElastiCache Redis<br/>(cluster mode)")]
             MSK["MSK (Kafka)"]
             S3B["S3 / Glacier"]
@@ -39,22 +40,25 @@ graph TB
     end
 
     U --> R53 --> WAFCF --> ING
-    ING --> TPOD & APOD & HPOD
+    ING --> TPOD & FPOD & UPOD
     TPOD -.mTLS.- MESH
-    APOD --> AURORA
-    APOD --> REDIS
+    TPOD -->|balance + ledger| DDB
+    TPOD -->|metadata| AURORA
+    TPOD --> REDIS
+    TPOD --> FPOD & UPOD
     TPOD --> MSK
-    MSK --> NPOD & HPOD
-    HPOD --> AURORA
-    ESO -.inject secrets.-> TPOD & APOD
-    TPOD & APOD & HPOD --> OTEL
+    MSK --> NPOD
+    TPOD -.balance / history read.-> DDB
+    DDB -->|Streams: refresh cache| AURORA
+    ESO -.inject secrets.-> TPOD & FPOD & UPOD
+    TPOD & FPOD & UPOD & NPOD --> OTEL
     OTEL --> PROM
-    TPOD & APOD --> FLUENT
-    AURORA -.snapshot.-> S3B
+    TPOD & FPOD & UPOD --> FLUENT
+    DDB -.export.-> S3B
 
     classDef pod fill:#e3f2fd,stroke:#1565c0,stroke-width:1px;
     classDef infra fill:#ede7f6,stroke:#4527a0,stroke-width:1px;
     classDef data fill:#f1f8e9,stroke:#33691e,stroke-width:1px;
-    class TPOD,APOD,HPOD,NPOD pod;
+    class TPOD,FPOD,UPOD,NPOD pod;
     class MESH,ESO,PROM,OTEL,FLUENT,ING infra;
     class AURORA,REDIS,MSK,S3B data;

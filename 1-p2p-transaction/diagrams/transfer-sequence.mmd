@@ -2,44 +2,64 @@ sequenceDiagram
     autonumber
     participant C as クライアント
     participant GW as API Gateway
-    participant T as Transfer Service
-    participant R as Redis (冪等/制限)
+    participant P as Payments Service
+    participant R as Redis (レート制限)
+    participant DDB as DynamoDB (残高 + 台帳 — 金額の真実)
+    participant PG as PostgreSQL (メタデータ + 残高キャッシュ)
+    participant MQ as Event Bus (Kafka)
     participant U as User Directory
     participant F as Fraud Engine
-    participant A as Account/Ledger Service
-    participant DB as Ledger DB (Aurora)
-    participant MQ as Event Bus (Kafka)
+    participant X as ML / AML APIs (外部)
     participant N as Notification
 
-    C->>GW: POST /transfers (Idempotency-Key, JWT)
+    rect rgb(225, 240, 255)
+    Note over C,MQ: 同期処理 — 減算のみ行い、200を返してイベント発火
+    C->>GW: POST /v1/transfers (Idempotency-Key, JWT)
     GW->>GW: JWT検証 / レート制限
-    GW->>T: createTransfer(req)
-
-    T->>R: SETNX idem:{key} = PROCESSING
-    alt キー既存 (重複リクエスト)
-        R-->>T: 既存の結果を返却
-        T-->>C: 200 (前回と同一レスポンス)
+    GW->>P: createTransfer(req)
+    P->>PG: transfersメタ書込 (status=DEBITED, note, idempotency_key)
+    alt キー既存 (重複)
+        PG-->>P: 競合 → 保存済みレスポンス返却
+        P-->>C: 200 (前回と同一)
     else 新規リクエスト
-        R-->>T: OK (ロック取得)
-        T->>U: resolve(email/phone) → recipientId
-        T->>R: 日次/取引限度チェック ($500 / $2,500)
-        T->>F: 不正ルール評価 (同期)
-        alt 高リスク
-            F-->>T: REVIEW/DENY
-            T-->>C: 422 (要レビュー)
-        else 許可
-            F-->>T: ALLOW
-            T->>A: executeTransfer(from,to,amount,txnId)
-            A->>DB: BEGIN (SERIALIZABLE)
-            A->>DB: 残高チェック + 二重仕訳 (debit/credit)
-            A->>DB: ledger_entries に追記 (immutable)
-            A->>DB: COMMIT
-            DB-->>A: OK
-            A-->>T: SUCCESS
-            T->>R: SET idem:{key} = SUCCESS(result)
-            T->>MQ: publish TransferCompleted
-            T-->>C: 201 Created (txnId, status=COMPLETED)
-            MQ-->>N: 受取人へ通知 (Push/SMS)
-            MQ-->>A: (履歴サービスへ非同期反映)
-        end
+        P->>R: 日次/取引限度チェック ($500 / $2,500)
+        P->>U: resolve(email/phone) → recipientId
+        Note over P,DDB: 単一 DynamoDB TransactWriteItems (原子的, 金額の真実)
+        P->>DDB: 条件: 送金者残高シャード >= 金額 (versionチェック)
+        P->>DDB: 送金者シャードをdebit, ESCROWシャードをcredit
+        P->>DDB: 台帳エントリをput (phase=DEBIT_TO_ESCROW)
+        P->>DDB: 冪等性ガードアイテム (transfer_id)
+        DDB-->>P: コミット (または ConditionalCheckFailed → 拒否/重複排除)
+        P-->>C: 200 OK (transfer_id, status=DEBITED)
+        P->>MQ: TransferRequested
+    end
+    end
+
+    rect rgb(255, 248, 225)
+    Note over DDB,PG: DynamoDB Streams → PostgreSQL残高キャッシュ更新 (非同期, 表示用のみ)
+    DDB-->>PG: 残高変更をストリーム → balance_cache_minor 更新
+    end
+
+    rect rgb(235, 255, 235)
+    Note over MQ,N: 非同期ワークフロー (ステートマシン — 複雑化すれば Step Functions)
+    MQ-->>P: (1) fraud ステップ
+    P->>F: fraud / AML チェック (怪しいマーチャント等)
+    F->>X: AML スクリーニング (+ MLスコアリング)
+    X-->>F: 結果
+    alt 却下 / 人手承認が必要
+        F-->>P: REVIEW または DENY
+        Note over P,DDB: 稀: 人による承認フロー → DENY時は補償
+        P->>DDB: TransactWriteItems 逆仕訳: ESCROW → 送金者 (phase=REVERSAL)
+        P->>PG: transfers.status = CANCELLED
+    else 通過
+        F-->>P: ALLOW
+        Note over P: (2) モラトリアム — settle_after まで待機し取消可能にする
+        P->>P: settle_after まで待機 (取消可能な期間)
+        Note over P,DDB: (3) トランザクション — 実際の振込 (DynamoDB TransactWriteItems)
+        P->>DDB: ESCROWシャードをdebit, 受取人シャードをcredit
+        P->>DDB: 台帳エントリをput (phase=ESCROW_TO_RECIPIENT)
+        P->>PG: transfers.status = SETTLED
+        P->>MQ: TransferSettled
+    end
+    MQ-->>N: (4) 送金者・受取人へ通知 (Push/SMS/Email)
     end

@@ -14,12 +14,11 @@ graph TB
     end
 
     subgraph Core["コアサービス (本設計のスコープ)"]
-        TRANSFER["Transfer Service<br/>送金オーケストレーション"]
-        ACCOUNT["Account/Ledger Service<br/>残高・台帳管理"]
+        PAYMENTS["<b>Payments Service</b><br/>同期: 送金者→escrowへ減算 (DynamoDB Tx), 200返却, イベント発火<br/>+ 冪等性 + 二重仕訳台帳<br/>+ 残高/履歴の読取 (DynamoDBから)<br/><i>(金額の真実はDynamoDB)</i>"]
+        WF["Settlement Workflow<br/>ステートマシン: fraud → モラトリアム<br/>→ 振込確定 → 通知<br/><i>(複雑なら Step Functions)</i>"]
         USER["User Directory Service<br/>電話/Email → userId 解決"]
-        TXHIST["Transaction History Service<br/>履歴照会 (CQRS Read)"]
         NOTIFY["Notification Service<br/>Push / SMS / Email"]
-        FRAUD["Fraud Rule Engine<br/>インライン ルールチェック"]
+        FRAUD["Fraud Rule Engine<br/>fraud / AML チェック (+ 人手承認)"]
     end
 
     subgraph Async["非同期基盤"]
@@ -27,10 +26,10 @@ graph TB
     end
 
     subgraph Data["データ層"]
-        LEDGERDB[("PostgreSQL<br/>Ledger / Accounts<br/>(Aurora, 強整合)")]
-        TXDB[("取引履歴 Store<br/>(読取最適化 / 7年保持)")]
-        CACHE[("Redis<br/>残高キャッシュ / 冪等キー / レート制限")]
-        ARCHIVE[("S3 + Glacier<br/>監査ログ長期保管")]
+        DDB[("<b>DynamoDB — 正 (金額)</b><br/>残高シャード + 全台帳 (約126億行/年)<br/>追記専用, 7年, account_id別<br/>TransactWriteItemsで原子的")]
+        LEDGERDB[("PostgreSQL (Aurora)<br/>メタデータ: users / transfersメタ / events / idempotency<br/>+ 残高<i>表示キャッシュ</i> (正ではない)")]
+        CACHE[("Redis<br/>キャッシュ / レート制限")]
+        ARCHIVE[("S3 + Glacier<br/>監査長期保管 / DynamoDBエクスポート")]
     end
 
     subgraph External["外部連携"]
@@ -41,28 +40,30 @@ graph TB
 
     MOBILE --> CDN --> WAF --> APIGW
     APIGW -->|JWT検証| AUTH
-    APIGW --> TRANSFER
-    APIGW --> TXHIST
-    APIGW --> ACCOUNT
+    APIGW -->|同期: 作成 + 減算| PAYMENTS
 
-    TRANSFER --> USER
-    TRANSFER --> FRAUD
-    TRANSFER --> ACCOUNT
-    TRANSFER -->|高リスク時| ML
-    TRANSFER --> AML
-    TRANSFER --> BANK
-    TRANSFER --> MQ
+    PAYMENTS --> USER
+    PAYMENTS --> CACHE
+    PAYMENTS -->|残高 + 台帳<br/>原子的 TransactWriteItems| DDB
+    PAYMENTS -.残高 / 履歴 読取.-> DDB
+    PAYMENTS -->|メタデータ / transfers / events| LEDGERDB
+    PAYMENTS -->|イベント発火| MQ
 
-    ACCOUNT --> LEDGERDB
-    ACCOUNT --> CACHE
-    MQ --> TXHIST
-    MQ --> NOTIFY
-    TXHIST --> TXDB
-    LEDGERDB -.CDC.-> ARCHIVE
+    MQ -->|ワークフロー駆動| WF
+    WF --> FRAUD
+    WF -->|モラトリアム後に振込確定| PAYMENTS
+    WF --> BANK
+    WF -->|両者へ通知| NOTIFY
+
+    FRAUD -->|高リスク時| ML
+    FRAUD --> AML
+
+    DDB -->|DynamoDB Streams<br/>残高キャッシュ更新| LEDGERDB
+    DDB -.エクスポート.-> ARCHIVE
 
     classDef scope fill:#e3f2fd,stroke:#1565c0,stroke-width:2px;
     classDef ext fill:#fff3e0,stroke:#e65100,stroke-width:1px;
     classDef data fill:#f1f8e9,stroke:#33691e,stroke-width:1px;
-    class TRANSFER,ACCOUNT,USER,TXHIST,NOTIFY,FRAUD scope;
+    class PAYMENTS,WF,USER,NOTIFY,FRAUD scope;
     class ML,AML,BANK,AUTH ext;
-    class LEDGERDB,TXDB,CACHE,ARCHIVE data;
+    class DDB,LEDGERDB,CACHE,ARCHIVE data;

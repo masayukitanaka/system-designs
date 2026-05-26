@@ -250,17 +250,23 @@ This document progressively elaborates in the order "overview → design princip
 3. **Immutable Audit Log**: The ledger is append-only. Balance is the aggregated result of ledger entries and is never overwritten.
 4. **Tiered consistency**: Balances/ledger use **strong consistency (synchronous)**; notifications/history reflection use **eventual consistency (asynchronous)**.
 5. **Failure-oriented design**: Assume every component can fail; eliminate SPOFs and add redundancy across Multi-AZ.
+6. **Sync debit, async settle**: The sender is debited into escrow synchronously (immediate, authoritative feedback + funds reserved), and the recipient is credited by an async workflow (fraud/AML → moratorium → settle). The "instant settlement" requirement is met via a **risk-tiered moratorium** that defaults to ~0 for low-risk transfers (effectively instant) and applies a short hold only to higher-risk ones — see §4.3 and the trade-offs in §7.2.
 
 #### Back-of-the-envelope Capacity Estimate
 | Item | Calculation | Result |
 |------|-------------|--------|
 | Average writes | 200 TPS | 2 ledger rows per transfer → 400 rows/s |
 | Peak writes | 1,000 TPS | 2,000 rows/s (burst) |
-| Reads (balance/history) | ~10x writes | ~2,000–10,000 RPS (assuming cache) |
-| Transaction data volume/year | 200 TPS × 86,400 × 365 × ~1KB | ~6.3 TB/year (~44 TB over 7 years) |
+| Reads (balance/history) | ~10x writes | ~2,000–10,000 RPS |
+| **Ledger rows/year** | 200 TPS × 2 rows × 86,400 × 365 | **~12.6 billion rows/year** (~88B over 7 years) |
+| Transaction data volume/year | ~12.6B rows × ~1KB | ~13 TB/year (~90 TB over 7 years) |
 | Required balance precision | Integer (minor unit = cents) | No floating point |
 
 > **Important**: All monetary amounts are held as `bigint` (minor units such as cents) to eliminate rounding errors.
+
+> **Key sizing decision — polyglot persistence, DynamoDB for money**: ~12.6B ledger rows/year is **too much for PostgreSQL**, so the entire transaction/ledger system and balances live in **DynamoDB**, which scales horizontally for this volume. PostgreSQL holds only **non-money metadata** plus a balance **display cache**:
+> - **DynamoDB (source of truth for money)** — balances (held as **sharded balance items** for hot accounts) + the full `ledger_entries` (append-only, 7-year, partitioned by `account_id`). All money movement is an atomic **`TransactWriteItems`** (balance shards + ledger entries + idempotency guard in one transaction). Balance inquiries and history reads are served from here.
+> - **PostgreSQL (metadata + cache)** — `users`, `user_identifiers`, `transfers` metadata (status, searchable memo), `transfer_events` (workflow state), `idempotency_keys`. It also keeps a **balance display cache** (`balance_cache_minor`) refreshed from **DynamoDB Streams** — *never* authoritative and *never* used for the debit decision.
 
 ---
 
@@ -270,33 +276,39 @@ This document progressively elaborates in the order "overview → design princip
 
 ![Architecture Overview](./architecture-overview.png)
 
-Requests pass through the edge layer `CloudFront → WAF → API Gateway/ALB` and, after JWT verification, are routed to the core services. The transfer path is orchestrated by the **Transfer Service**, while balance updates are handled by the **Account/Ledger Service** in strongly consistent transactions. Notifications and history reflection are made asynchronous via the event bus.
+Requests pass through the edge layer `CloudFront → WAF → API Gateway/ALB` and, after JWT verification, are routed to the appropriate service. The transfer flow, the double-entry ledger, and history queries are all handled inside a single **Payments Service** within strongly consistent transactions. Notifications, recipient resolution, and fraud checks are delegated to independent services, and notifications/history fan-out are made asynchronous via the event bus.
 
-#### Why Microservices (vs Monolith)
+#### Service Decomposition Principle
+We do **not** split services along URL paths (e.g., one service per `/transfers`, `/transactions`, `/accounts`). Services are split along **transactional and data-ownership boundaries**, not API surface.
+
+- The transfer flow, balance updates, the double-entry ledger, and transaction history all read and write the **same data** and must participate in the **same ACID transaction** (e.g., debit/credit and the `transfers` status update must be atomic). Splitting them would force distributed transactions / Sagas for the core money-movement path — accidental complexity with no benefit. → Therefore they are consolidated into a single **Payments Service**.
+- **Fraud Engine**, **User Directory**, and **Notification** are genuinely independent concerns (different data, different failure modes, different scaling profiles, callable in isolation) → they **remain separate services**.
+
+#### Why This Split (vs Monolith / vs URL-based split)
 | Aspect | Decision |
 |--------|----------|
-| **Independent scaling** | Transfers (writes) and history queries (reads) have very different load profiles. We want to scale them separately |
-| **Fault isolation** | Prevent failures in the notification service from cascading into the transfer core |
-| **Compliance boundary** | Clearly isolate the ledger service to centralize auditing and access control |
-| **Trade-off** | Increased complexity of distributed transactions → addressed by the Saga/eventual consistency described later. Keep the number of services small initially |
+| **Single transaction for money movement** | Transfer + ledger + history share data and must be atomic. Keep them in one **Payments Service** to use a single DB transaction instead of a distributed Saga |
+| **Fault isolation** | Keep Notification / Fraud separate so their failures never block the money-movement core (graceful degradation) |
+| **Independent scaling where it matters** | Read-heavy history is served from read replicas *within* Payments Service; Fraud/Notification scale on their own load profiles |
+| **Trade-off** | The Payments Service is larger (it owns reads and writes), but avoids distributed-transaction complexity on the critical path. Read scaling is handled by CQRS read replicas, not by carving out a separate service |
 
-> **Incremental approach**: The minimal configuration is two services, "Transfer + Account/Ledger." History / Notification / Fraud are carved out as demand requires. Avoid over-decomposition.
+> **Incremental approach**: Start with **Payments Service** as the core, plus the independent **Fraud / User Directory / Notification** services. Split further only when a real transactional/scaling boundary demands it — never merely because a different URL prefix exists.
 
 #### Responsibilities of Key Components
 | Component | Responsibility |
 |-----------|----------------|
 | **API Gateway / ALB** | JWT verification, rate limiting, routing, TLS termination |
-| **Transfer Service** | Orchestration of the transfer flow, idempotency control, limit checks, invoking fraud detection |
-| **Account/Ledger Service** | Strongly consistent balance updates, appending to the double-entry ledger. **The sole owner of balance updates** |
+| **Payments Service** | The money-movement core. Orchestrates the transfer flow, idempotency control, limit checks, invokes fraud detection; performs strongly consistent balance updates and appends to the double-entry ledger (**the sole owner of balance updates**); serves transaction history via CQRS reads (7-year retention). All money-movement state lives here in one transactional boundary |
 | **User Directory Service** | Resolving phone/email → `user_id` (recipient identification) |
-| **Transaction History Service** | The read side of CQRS. Optimized for history queries. 7-year retention |
 | **Notification Service** | Push/SMS/Email notifications (asynchronous, eventually consistent) |
-| **Fraud Rule Engine** | Inline rule-based fraud checks |
+| **Fraud Rule Engine** | Inline rule-based fraud checks. **Owns all integrations with external risk APIs** — calls the ML fraud-scoring API and the AML screening API on behalf of the Payments Service |
 | **Event Bus (Kafka/SQS)** | Asynchronous inter-service communication. Event delivery from the outbox |
 
 #### External Integrations
-- **ML fraud scoring API**: Synchronous call only when judged high-risk (falls back on timeout)
-- **AML screening API**: Sanctions-list matching
+External risk APIs are **not called directly by the Payments Service**; they are accessed through the **Fraud Service**, which acts as the single integration point for risk/compliance. This keeps fraud/AML concerns (vendor SDKs, credentials, fallback policy, false-positive handling) out of the money-movement core.
+
+- **ML fraud scoring API**: Called by the Fraud Service, synchronously only when judged high-risk (falls back on timeout)
+- **AML screening API**: Called by the Fraud Service for sanctions-list matching
 - **Bank/payment network (RTP / FedNow)**: Instant gross settlement. Externalized in this design as the "final network for moving funds"
 
 ### 2.2 Kubernetes (EKS)-Based Deployment
@@ -346,26 +358,41 @@ Core services are deployed on **Amazon EKS** on AWS. Data stores (Aurora / Elast
 
 ![Database Schema](./database-schema.png)
 
-| Entity | Role | Key Points |
-|--------|------|------------|
-| **users** | Users (KYC done) | Synced from upstream. This service is reference-centric |
-| **user_identifiers** | Email/phone → userId | Unique index on `value`. Used for recipient resolution |
-| **accounts** | Holds balance | `balance_minor`(bigint) + `version`(optimistic lock). Balance is reconciled daily against the aggregate of ledger entries |
-| **transfers** | Transfer transaction | State transitions managed by `status`. Unique constraint on `idempotency_key` |
-| **ledger_entries** | Double-entry ledger | **Append-only / immutable**. Two rows (debit/credit) per transfer. Holds `balance_after` for auditing |
-| **idempotency_keys** | Idempotency control | Stores request hash and response. Has a TTL |
+| Entity | Store | Role | Key Points |
+|--------|-------|------|------------|
+| **balance shards** | **DynamoDB** | Authoritative balance | Balance per account, kept as **N sharded items** (`ACCOUNT-id-SHARD-n`) for hot accounts; updated by conditional write (`version` + `balance >= amount`). **The source of truth for money** |
+| **ledger** | **DynamoDB** | Full double-entry ledger | All entries, append-only, 7-year. Partition key `account_id`, sort key `ts-entry_id`; GSI on `transfer_id`. ~12.6B rows/yr. Authoritative for **history/audit** |
+| **users** | PostgreSQL | Users (KYC done) | Synced from upstream. Reference-centric metadata |
+| **user_identifiers** | PostgreSQL | Email/phone → userId | Unique index on `value`. Used for recipient resolution |
+| **accounts (meta)** | PostgreSQL | Account metadata + balance **cache** | `type` (USER / **ESCROW**), currency, etc. `balance_cache_minor` is a **display cache only** (refreshed from DynamoDB Streams), never authoritative, never used for the debit decision |
+| **transfers (meta)** | PostgreSQL | Transfer metadata / search / workflow | Lifecycle `status` (`DEBITED → FRAUD_REVIEW → MORATORIUM → SETTLED`, or `CANCELLED`/`REVERSED`), searchable `note`, `settle_after`. Unique constraint on `idempotency_key`. **Money amounts live in DynamoDB, not here** |
+| **transfer_events** | PostgreSQL | Workflow tracking | Each async step (`FRAUD`/`MORATORIUM`/`SETTLE`/`NOTIFY`) and its state — the durable state of the settlement workflow |
+| **idempotency_keys** | PostgreSQL | Idempotency control | Request hash + response. (The DynamoDB transaction also carries its own idempotency guard item — see below.) |
 
-#### Concept of the Double-Entry Ledger
-A transfer `A → B ($10)` is always recorded as **two entries that sum to zero**.
+#### Concept of the Double-Entry Ledger (with escrow)
+Because the recipient credit is **deferred** (async settlement after fraud + moratorium), money never vanishes in between: the synchronous step moves funds from the sender **into a system escrow (clearing) account**, and settlement later moves them from escrow to the recipient. Every phase is a **balanced pair that sums to zero**.
+
+Each phase is one **DynamoDB `TransactWriteItems`** that atomically updates the balance shards and appends the ledger entries:
 
 ```
-ledger_entries:
-  (transfer_id=T1, account=A, amount_minor=-1000, balance_after=...)  -- debit
-  (transfer_id=T1, account=B, amount_minor=+1000, balance_after=...)  -- credit
-  → Σ amount = 0 (conservation of funds)
+Phase 1 (SYNC, at POST):   sender → escrow   [one TransactWriteItems]
+  - decrement sender balance shard   (condition: balance >= amount AND version matches)
+  - increment escrow balance shard
+  - put ledger entry (account=sender, amount=-1000, phase=DEBIT_TO_ESCROW)
+  - put ledger entry (account=escrow, amount=+1000, phase=DEBIT_TO_ESCROW)
+  - put idempotency guard item (condition: not exists)
+
+Phase 2 (ASYNC, at settlement):  escrow → recipient   [one TransactWriteItems]
+  - decrement escrow shard, increment recipient shard
+  - put ledger entries (phase=ESCROW_TO_RECIPIENT)
+
+  → Σ amount = 0 at every phase (conservation of funds; escrow nets to 0 once settled)
+  Cancellation instead writes a REVERSAL TransactWriteItems (escrow → sender).
 ```
 
-The balance (`accounts.balance_minor`) is a **materialized view** for performance; the source of truth is the aggregation of `ledger_entries`. This makes auditing and reconciliation possible.
+**Where is the truth?** **Money lives in DynamoDB.** The authoritative balance is the sum of an account's balance shards in DynamoDB, mutated only via conditional `TransactWriteItems` (so a debit cannot overspend or double-apply). The DynamoDB ledger is the immutable system of record for history/audit. **PostgreSQL holds no authoritative money** — its `balance_cache_minor` is a display cache refreshed asynchronously from DynamoDB Streams and is never read for the debit decision. Reconciliation verifies that the sum of balance shards equals the running ledger total and that escrow equals the in-flight total. This is a deliberate **polyglot-persistence** split: DynamoDB for the massive, horizontally-scaled money store; PostgreSQL for rich relational metadata, search, and workflow state.
+
+> **Why shard the balance?** A single hot account (e.g. a popular merchant) would serialize on one DynamoDB item. Splitting the balance into N shards spreads concurrent debits/credits across N partition keys; the true balance is the sum of shards. Reads sum the shards; writes target one shard (credits any shard, debits pick a shard with sufficient funds or briefly consolidate).
 
 ### 4.2 Key Endpoints (API Contract)
 
@@ -375,7 +402,8 @@ The balance (`accounts.balance_minor`) is a **materialized view** for performanc
 | `GET` | `/v1/transfers/{transferId}` | Query transfer status | Naturally idempotent |
 | `GET` | `/v1/accounts/me/balance` | Balance inquiry | Naturally idempotent |
 | `GET` | `/v1/transfers?cursor=&limit=` | Transaction history (cursor paging) | Naturally idempotent |
-| `POST` | `/v1/transfers/{transferId}/reverse` | Refund/reversal (compensating transaction) | **Required** |
+| `POST` | `/v1/transfers/{transferId}/cancel` | Cancel during the moratorium window (before SETTLED) — appends a reversal | **Required** |
+| `POST` | `/v1/transfers/{transferId}/reverse` | Post-settlement refund (compensating transaction) | **Required** |
 
 #### Example `POST /v1/transfers` Request
 ```http
@@ -391,11 +419,13 @@ Idempotency-Key: 5f3c...e9   # client-generated UUID
 }
 ```
 #### Example Response
+The synchronous response returns immediately after the sender is debited into escrow; the recipient is credited later by the async workflow.
 ```json
 {
   "transfer_id": "txn_01H...",
-  "status": "COMPLETED",
+  "status": "DEBITED",
   "amount_minor": 1000,
+  "settle_after": "2026-05-25T12:01:00Z",
   "created_at": "2026-05-25T12:00:00Z"
 }
 ```
@@ -404,11 +434,21 @@ Idempotency-Key: 5f3c...e9   # client-generated UUID
 
 ![Transfer Sequence](./transfer-sequence.png)
 
-The four key points are as follows.
-1. **Idempotency check first**: Lock with `SETNX idem:{key}`. Duplicates return the previous response.
-2. **Limit and fraud checks before the ledger update**: Avoid wasted writes.
-3. **Balance update in a single transaction** (`SERIALIZABLE`): Atomically run balance check, debit, and credit.
-4. **Notifications and history reflection are asynchronous**: Keep the synchronous path short to meet the latency target (3 seconds).
+The flow is deliberately split into a **short synchronous path** (so `POST /v1/transfers` returns fast) and an **asynchronous settlement workflow**.
+
+**Synchronous (`POST /v1/transfers` → 200 OK + event):**
+1. **Metadata + idempotency**: Write the `transfers` metadata row to PostgreSQL (unique constraint on `idempotency_key`); a duplicate conflicts and the stored response is returned.
+2. **Limit check** (e.g. $500/txn, $2,500/day) and **recipient resolution** happen here — cheap to reject early.
+3. **Debit only, into escrow — in DynamoDB**: One **`TransactWriteItems`** atomically decrements the sender balance shard (conditional: `balance >= amount` and `version` matches), increments the escrow shard, appends the two ledger entries (`phase=DEBIT_TO_ESCROW`), and writes the idempotency guard item. A `ConditionalCheckFailed` means insufficient funds or a replay → reject/dedupe. The recipient is **not** credited yet.
+4. Return `200 OK (status=DEBITED)` and publish `TransferRequested` to Kafka.
+
+**Asynchronous settlement workflow (state machine; AWS Step Functions if it grows complex):**
+1. **Fraud / AML check**: Suspicious-merchant and AML screening. A small fraction may require a **human approval flow**. On deny → compensate with a `REVERSAL` `TransactWriteItems` (escrow → sender) and set `transfers.status=CANCELLED`.
+2. **Moratorium**: Wait until `settle_after` so the user can still cancel the transfer (cancellable window).
+3. **Settlement (the actual transfer)**: One `TransactWriteItems` moves escrow → recipient (`phase=ESCROW_TO_RECIPIENT`); update `transfers.status=SETTLED` in PostgreSQL.
+4. **Notification**: Notify both the sender and the recipient (Push/SMS/Email).
+
+> **Why this split?** Debiting synchronously gives the sender immediate, authoritative feedback and reserves the funds (the conditional DynamoDB write prevents double-spend), while deferring the credit lets us run fraud/AML and offer a cancellation window without holding the client request open. Escrow keeps the ledger balanced at every step, and `transfer_events` (PostgreSQL) makes the workflow durable and resumable after a crash.
 
 ---
 
@@ -423,7 +463,7 @@ The four key points are as follows.
 | **PII protection** | Mask phone/email/amount in logs and traces. Minimal retention |
 | **Input validation** | Schema validation, amount upper-bound/positive-value checks, parameterized SQL (ORM to prevent injection) |
 | **Rate limiting / WAF** | Per-user and per-IP token bucket. WAF blocks L7 attacks and bots |
-| **Fraud / AML** | Inline rule checks (velocity, new recipient, anomalous amount) + external ML/AML calls |
+| **Fraud / AML** | The Fraud Service performs inline rule checks (velocity, new recipient, anomalous amount) and is the sole caller of the external ML/AML APIs; the Payments Service only calls the Fraud Service |
 | **Idempotency & replay prevention** | `Idempotency-Key` + request-hash matching (reject same key with a different body) |
 | **Audit** | Record all state changes in an immutable log (who, when, what). WORM via S3 Object Lock |
 | **Compliance** | SOC2 (PCI-DSS out of scope since no card data). Separation of duties, access reviews |
@@ -436,15 +476,15 @@ The four key points are as follows.
 ## 6. Realizing Non-Functional Requirements (Performance)
 
 ### 6.1 Latency (Target p99 ≤ 3 seconds)
-- **Minimize the synchronous path**: Make notifications, history reflection, and ML analysis asynchronous, narrowing the critical path to "idempotency check → limit → rules → ledger update."
-- **Balance cache**: Balance inquiries use Redis (write-through). Update the cache on writes to maintain consistency.
-- **Connection pooling**: Reuse DB connections with RDS Proxy / PgBouncer to avoid connection exhaustion and handshake latency.
-- **Hot-account mitigation**: To curb row-lock contention, consider the sharding/bucketed-ledger approach described later.
+- **Minimize the synchronous path**: The synchronous request only does "idempotency check → limit check → recipient resolution → debit into escrow → return 200." Fraud/AML, the moratorium, settlement, and notifications are all moved to the async workflow, keeping the user-facing latency well under 3 seconds.
+- **Balance reads**: The authoritative balance is the sum of an account's DynamoDB balance shards (low-latency, strongly-consistent read when needed). The PostgreSQL `balance_cache_minor` may back fast UI display, but the **debit decision always reads/writes DynamoDB**, never the cache.
+- **Connection pooling**: Reuse PostgreSQL connections with RDS Proxy / PgBouncer; DynamoDB is accessed over HTTP with the SDK's connection reuse.
+- **Hot-account mitigation**: Balance sharding (sum of N shard items) spreads concurrent debits/credits for hot accounts across partition keys, avoiding a single-item bottleneck.
 
 ### 6.2 Throughput & Scalability (200→1,000 TPS, future 10x)
 - **Stateless core services** + HPA for horizontal scaling. State is externalized to DB/Redis/Kafka.
-- **Read/write separation (CQRS)**: Writes go to the Aurora Writer; reads (history/balance) go to Reader replicas + a dedicated History Store.
-- **Database horizontal partitioning**: A design where `accounts` / `ledger_entries` can be sharded by `account_id` (see Tunable Decisions below).
+- **Polyglot storage**: All money (balance + ledger) is in **DynamoDB**, which scales horizontally for the ~12.6B rows/yr write/read volume; balance and history reads go there. PostgreSQL handles only bounded metadata/search/workflow, so the relational tier never carries the huge stream.
+- **Native partitioning**: DynamoDB partitions by `account_id` (balance shards add an extra shard suffix for hot accounts); PostgreSQL metadata is small and can be partitioned/sharded by `account_id` if ever needed (see Tunable Decisions below).
 - **Event-driven load leveling**: During bursts, the queue acts as a buffer, protecting downstream (e.g., notifications).
 
 ### 6.3 Availability (99.99%)
@@ -454,9 +494,11 @@ The four key points are as follows.
 - **Circuit breakers & timeouts**: Cut off + fall back so that latency in external APIs (ML/AML/bank) does not drag down the whole system.
 
 ### 6.4 Consistency & Reliability
-- **Strongly consistent ledger updates**: Balance updates happen in a single DB transaction (`SERIALIZABLE`, or row locks + optimistic version).
-- **Transactional Outbox + CDC**: Guarantee "DB update" and "event publication" in the same transaction to prevent double publication / loss (at-least-once + idempotent consumer).
-- **Idempotent consumer**: Notifications and history deduplicate by `transfer_id`.
+- **Atomic money movement in DynamoDB**: Balance-shard updates + ledger entries + the idempotency guard are one **`TransactWriteItems`** with conditional expressions (`balance >= amount`, `version` match, guard `attribute_not_exists`). This is the all-or-nothing money mutation — no partial debit/credit, no overspend, no double-apply.
+- **Cache is asynchronous, never authoritative**: The PostgreSQL `balance_cache_minor` is refreshed from **DynamoDB Streams** (eventually consistent). It is display-only; staleness can never cause a wrong debit because debits read/condition on DynamoDB.
+- **Cross-store metadata**: The `transfers` metadata write (PostgreSQL) and the money write (DynamoDB) are two stores; we order them so the metadata row (idempotency key) is written first, then the conditional DynamoDB transaction. A crash between them is reconciled by the workflow (a `DEBITED` metadata row with no matching ledger entry is retried or rolled back).
+- **Idempotent everywhere**: The DynamoDB transaction's guard item and the Kafka consumers' dedupe by `transfer_id` make retries safe.
+- **Continuous reconciliation**: A job verifies that the sum of an account's balance shards equals its running ledger total in DynamoDB, and that escrow equals the in-flight total; divergence raises an alert.
 
 ---
 
@@ -464,22 +506,25 @@ The four key points are as follows.
 
 This section presents points that can change depending on requirements, along with their trade-offs, making it clear that "there is no single right answer."
 
-### 7.1 Changing from RDB (Aurora PostgreSQL) to DynamoDB
-| Aspect | RDB (current) | DynamoDB |
-|--------|---------------|----------|
-| **Transactions** | Multi-row ACID, easy `SERIALIZABLE` | Constrained by `TransactWriteItems` (max 100 items). Double-entry needs care |
-| **Scaling** | Handled by vertical + read replicas + sharding | Nearly unlimited horizontal scaling, easy to operate |
-| **Hot partitions** | Hot row-lock contention | Key design is crucial to distribute hot partitions |
-| **Consistency** | Strong consistency is natural | Achievable via conditional writes (optimistic locking). Poor fit for aggregate queries |
-| **Conclusion** | **First choice for a financial ledger's strong consistency and complex queries** | Favorable for ultra-large scale and simple access patterns. For the ledger, an alternative design with conditional writes + idempotency |
+### 7.1 Polyglot Persistence: DynamoDB for money, PostgreSQL for metadata
+The volume (~12.6B ledger rows/year) rules out PostgreSQL for the ledger, so money (balance + ledger) lives in **DynamoDB**, and PostgreSQL keeps only metadata + a display cache:
 
-> Trade-off: DynamoDB is strong in availability and scale, but complexity increases for the atomicity of double-entry and the aggregate queries used for reconciliation. For this use case (a strongly consistent ledger) we recommend RDB, while leaving open the option of a hybrid "account partitioning + DynamoDB" at ultra-large scale.
+| Aspect | DynamoDB (money: balance + ledger) | PostgreSQL (metadata + cache) |
+|--------|------------------------------------|-------------------------------|
+| **Holds** | Authoritative balance (sharded) + full ledger, 7-year, append-only | users, transfers meta, workflow events, idempotency, **balance display cache** |
+| **Transactions** | `TransactWriteItems` (up to 25 items) — atomic balance + ledger + guard | Multi-row ACID for metadata (not money) |
+| **Scaling** | Near-unlimited horizontal scale; sharded balances avoid hot items | Bounded, small relational data; easy to operate |
+| **Consistency** | Strongly-consistent reads + conditional writes for the debit decision | The cache is eventually consistent (DynamoDB Streams); never authoritative |
+| **Why** | Massive write throughput + cheap long-term retention for the ledger | Rich queries: search by memo, joins, workflow state, reporting |
+
+> Trade-off: putting money in DynamoDB means the **double-entry atomicity and overspend prevention must be expressed as conditional `TransactWriteItems`** (and hot accounts need balance sharding), rather than relying on familiar SQL `SERIALIZABLE`. We accept this because the ledger volume is infeasible for PostgreSQL, and DynamoDB's conditional transactions + sharding give both the scale and the correctness. The metadata/cache in PostgreSQL is eventually consistent with DynamoDB (via Streams), reconciled by a continuous job. **Alternatives**: (a) all-PostgreSQL with partitioning + S3 archival — simplest consistency story but the row volume is operationally infeasible; (b) money in PostgreSQL, history in DynamoDB (the previous iteration) — keeps SQL ACID for balances but still needs cross-store sync and caps balance scale at the relational Writer. Putting the whole money store in DynamoDB is the choice when ledger scale dominates.
 
 ### 7.2 Other Tunable Points
 | Tunable axis | Option A | Option B | Trade-off |
 |--------------|----------|----------|-----------|
-| **Transfer confirmation** | Synchronous (immediate COMPLETED) | Asynchronous (PENDING→Webhook) | Sync = good UX / sensitive to availability; async = high availability / UX needs work. The requirement is "instant," so sync is the baseline |
-| **Consistency model** | Strong consistency (ledger) | Eventual consistency | Balance requires strong consistency. Notifications/history take eventual consistency to gain availability (CAP trade-off) |
+| **Transfer confirmation** | Fully synchronous (immediate COMPLETED) | **Sync debit + async settle** (chosen) | Fully sync gives the simplest UX but leaves no room for fraud review / cancellation and couples settlement to request availability. We chose sync-debit-into-escrow + async settlement: the sender gets immediate authoritative feedback, while fraud/AML and a moratorium run off the critical path. Trade-off: the recipient sees funds after settlement, not instantly — acceptable given the moratorium/fraud requirements |
+| **Moratorium length** | 0 (settle immediately) | Minutes–hours | Longer window = more cancellation/fraud safety but slower perceived delivery. Tunable per risk tier (e.g. new recipient, large amount) via `settle_after` |
+| **Consistency model** | Strong consistency (balance/ledger in DynamoDB) | Eventual consistency (PG balance cache, notifications) | Money uses strongly-consistent conditional writes in DynamoDB. The PostgreSQL display cache and notifications are eventually consistent for availability (CAP trade-off) |
 | **Messaging** | Kafka (MSK) | SQS/SNS | Kafka = high throughput / strong reprocessing; SQS = simpler ops. Choose by scale |
 | **Fraud detection** | Inline only | Inline + ML | Latency vs detection accuracy. Use sync ML only for high-risk to balance both |
 | **Multi-region** | Single region (current, US-only) | Active/passive DR | Cost vs RTO/RPO. Initially single region + regional backups |
@@ -492,40 +537,45 @@ This section presents points that can change depending on requirements, along wi
 Centered on the deep-dive questions in Part 3, this section lists points likely to be asked in an interview along with model answers.
 
 ### Q1. If the server crashes mid-transfer, how do you recover?
-**A.** Because balance updates are done atomically in a single DB transaction, a crash before COMMIT is **automatically rolled back**, so no partial debit occurs. Furthermore, state is managed via `transfers.status` (PENDING→COMPLETED/FAILED), and a recovery job on startup detects "transfers left in PENDING" and finalizes them—completing or compensating (reversal) based on whether ledger entries exist. Event publication is tied to the commit in the same transaction via the Transactional Outbox, which also prevents loss.
+**A.** Each money-moving step (the synchronous debit-to-escrow, and the asynchronous settlement) is a single **DynamoDB `TransactWriteItems`**, which is all-or-nothing — a crash before it commits leaves no partial debit/credit. The settlement workflow is **durable, not in-memory**: its progress lives in `transfers.status` and `transfer_events` (PostgreSQL). A crash mid-workflow is recovered by re-driving from the last persisted state; each step is idempotent — the DynamoDB transaction carries a guard item keyed by `transfer_id`/phase, so re-execution is a no-op (`ConditionalCheckFailed`) rather than a double-apply. Because the recipient is only credited at settlement (not at the synchronous step), a crash after the debit simply leaves funds safely in **escrow** until the workflow resumes. The one cross-store gap — `transfers` metadata in PostgreSQL written just before the DynamoDB money write — is reconciled: a `DEBITED` metadata row with no matching DynamoDB ledger entry is retried or rolled back by a sweeper. If the orchestration grows complex, AWS Step Functions provides this durable execution out of the box.
 
 ### Q2. If the same request arrives twice due to a network retry, how do you prevent a double transfer?
-**A.** Require a client-generated `Idempotency-Key`. The Transfer Service first attempts a lock with `SETNX idem:{key}`, and if it already exists, returns **the same response as before** (no new transfer is made). At the persistence layer too, a unique constraint is placed on `transfers.idempotency_key` as the last line of defense in case of a Redis failure. In addition, the request hash is stored so that "the same key with a different body" is rejected as a conflict.
+**A.** Require a client-generated `Idempotency-Key`. Two layers: (1) the PostgreSQL `transfers` metadata row has a **unique constraint** on `idempotency_key`, so a duplicate create conflicts and returns the prior response; (2) more importantly, the money mutation's **`TransactWriteItems` includes a guard item** keyed by `transfer_id`/phase with an `attribute_not_exists` condition — so even if the same transaction is retried, the conditional write fails (`ConditionalCheckFailed`) and the balance is debited exactly once. Idempotency thus protects the money write atomically inside DynamoDB, not just at the metadata layer. The stored request hash also lets us reject "the same key with a different body" as a conflict.
 
 ### Q3. If a balance read and update happen concurrently, how do you ensure consistency?
-**A.** Use two approaches together. (1) Balance updates use `SELECT ... FOR UPDATE` (pessimistic lock) within a single transaction, or **optimistic locking** via a `version` column (CAS-style update with retry on conflict). (2) Since balance is an aggregation of the double-entry ledger and `ledger_entries` is the source of truth, even if `accounts.balance_minor` drifts it can be detected and corrected by daily reconciliation. The key is not to split the balance check and debit into separate transactions (avoiding TOCTOU).
+**A.** The balance lives in DynamoDB and is mutated only by **conditional `TransactWriteItems`**: the debit carries a condition like `balance >= amount AND version = N` (optimistic concurrency). Two concurrent debits race on the condition — one succeeds and bumps `version`, the other gets `ConditionalCheckFailed` and retries against the fresh value, so there is no lost update or overspend (no TOCTOU, because the check and the write are the same atomic operation). The check is **never** done against the PostgreSQL cache. For hot accounts, balance sharding means concurrent operations usually hit different shard items and don't contend at all; a debit that needs more than one shard holds them together in the single transaction. Drift is impossible by construction, but a reconciliation job still verifies shard-sum = ledger total.
 
 ### Q4. Where are the SPOFs (single points of failure), and how do you eliminate them?
 **A.**
-- **DB**: Aurora Multi-AZ (automatic failover) + read replicas.
-- **Cache**: ElastiCache cluster mode (shards + replicas). On Redis failure, fall back to reading directly from the DB.
+- **Money store**: DynamoDB is multi-AZ and regionally replicated by design (no single node to lose); the authoritative balance/ledger has no single point of failure.
+- **Metadata DB**: Aurora Multi-AZ (automatic failover) + read replicas.
+- **Cache**: ElastiCache cluster mode (shards + replicas); also, the PostgreSQL balance cache is non-authoritative, so its staleness/failure never blocks a debit (which reads DynamoDB).
 - **Messaging**: MSK across multiple brokers/AZs.
 - **Compute**: EKS Multi-AZ, AZ distribution via PodAntiAffinity, redundancy via HPA.
 - **Edge**: DNS failover via CloudFront/Route 53.
 - **External APIs**: Circuit breaker + timeout + fallback (e.g., if ML is down, degrade to rule-based judgment).
 
 ### Q5. If transaction volume increases 10x (~10,000 TPS), where is the bottleneck and how do you scale?
-**A.** The first limit is the **write DB (especially row-lock contention on hot accounts)**. Countermeasures, applied incrementally:
-1. Thoroughly separate reads and writes (offload history/balance queries to replicas and the History Store).
-2. **Shard** writes horizontally based on `account_id`.
-3. For hot accounts (e.g., merchants), **bucket the ledger entries** (post across multiple sub-balances and compute the total) to relax lock contention.
-4. Trim synchronous processing further, moving to Outbox + async.
-5. If needed, migrate the ledger storage to "account partitioning + DynamoDB (conditional writes)" (see the trade-off in 7.1).
-The next bottleneck, connection count, is absorbed by RDS Proxy; messaging is handled by adding partitions.
+**A.** Balance + ledger are in **DynamoDB**, which scales horizontally near-linearly, so the money store is not the first wall. The pressure points and countermeasures, incrementally:
+1. **Hot account contention** is the main risk — a single popular account would serialize on one balance item. Mitigate with **balance sharding** (N shard items per account, sum on read), increasing shard count for the hottest accounts.
+2. Keep the synchronous path minimal (one `TransactWriteItems` debit-to-escrow); push fraud/moratorium/settlement/notify to the async workflow.
+3. Use **DynamoDB on-demand or auto-scaling** so capacity tracks the write stream; design partition keys (`account_id` + shard suffix) to avoid hot partitions.
+4. The **PostgreSQL metadata** tier is bounded and small relative to the ledger; scale it with read replicas, and partition by `account_id` only if needed. The balance cache is refreshed by DynamoDB Streams consumers, which scale by shard.
+5. Messaging scales by adding Kafka partitions; the workflow scales as stateless workers driven by the durable state.
+The next bottleneck, connection count to PostgreSQL, is absorbed by RDS Proxy.
 
-### Q6. Why microservices? Is a monolith not acceptable?
-**A.** Start small initially with about two services (Transfer + Account/Ledger), and carve out areas (History/Notification/Fraud) as the need arises for load characteristics, fault isolation, and compliance boundaries. The main motivations for splitting are that reads (history) and writes (transfers) have very different scaling characteristics, and the desire to isolate notification failures from the transfer core. Avoid excessive splitting, as it invites the complexity of distributed transactions.
+### Q6. How did you decide service boundaries? Why not split by URL path, and why not a full monolith?
+**A.** Boundaries follow **transactional and data-ownership lines, not URL paths**. The transfer flow, balance/ledger mutations (DynamoDB), and transfer metadata (PostgreSQL) are all part of one money-movement unit and must be coordinated atomically, so splitting them by URL (`/transfers`, `/transactions`, `/accounts`) would force a distributed transaction / Saga on the critical path for no benefit. We therefore keep them in a single **Payments Service** that owns both stores. Conversely, **Fraud**, **User Directory**, and **Notification** are genuinely independent (separate data, separate failure modes, separate scaling) and stay as their own services so their failures don't block money movement. This is neither a full monolith (independent concerns are isolated) nor an over-decomposed mesh (the atomic core stays together).
 
 ### Q7. How do you represent monetary amounts? What about floating point?
 **A.** Do not use it. Hold amounts as `bigint` minor units (cents) to eliminate rounding and representation errors. The currency is fixed to USD (per requirements), but a currency code is retained to prepare for future multi-currency.
 
-### Q8. How do you handle reversals/refunds of a transfer?
-**A.** Since existing `ledger_entries` are immutable, do not overwrite them; instead append new reverse entries as a **compensating transaction (reversal)** (`status=REVERSED`). This keeps the audit trail fully intact.
+### Q8. How do you handle cancellation and reversals/refunds?
+**A.** Two cases, both append-only (existing `ledger_entries` are never mutated):
+- **Cancellation during the moratorium** (before `SETTLED`): the funds are still in escrow, so we append a `REVERSAL` pair (escrow → sender) and set `status=CANCELLED`. The recipient was never credited, so nothing to claw back.
+- **Post-settlement refund**: append a compensating `REVERSAL` pair (recipient → sender, via escrow) and set `status=REVERSED`.
+
+In both cases the immutable ledger preserves a complete audit trail, and `transfer_events` records who/what triggered the change.
 
 ---
 

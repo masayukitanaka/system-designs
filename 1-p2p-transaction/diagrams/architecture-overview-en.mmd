@@ -14,12 +14,11 @@ graph TB
     end
 
     subgraph Core["Core Services (scope of this design)"]
-        TRANSFER["Transfer Service<br/>transfer orchestration"]
-        ACCOUNT["Account/Ledger Service<br/>balance & ledger management"]
+        PAYMENTS["<b>Payments Service</b><br/>SYNC: debit sender → escrow (DynamoDB Tx), return 200, fire event<br/>+ idempotency + double-entry ledger<br/>+ balance/history reads (from DynamoDB)<br/><i>(money truth in DynamoDB)</i>"]
+        WF["Settlement Workflow<br/>state machine: fraud → moratorium<br/>→ settle → notify<br/><i>(Step Functions if complex)</i>"]
         USER["User Directory Service<br/>phone/email → userId resolution"]
-        TXHIST["Transaction History Service<br/>history query (CQRS Read)"]
         NOTIFY["Notification Service<br/>Push / SMS / Email"]
-        FRAUD["Fraud Rule Engine<br/>inline rule checks"]
+        FRAUD["Fraud Rule Engine<br/>fraud / AML checks (+ manual review)"]
     end
 
     subgraph Async["Async Infrastructure"]
@@ -27,10 +26,10 @@ graph TB
     end
 
     subgraph Data["Data Layer"]
-        LEDGERDB[("PostgreSQL<br/>Ledger / Accounts<br/>(Aurora, strong consistency)")]
-        TXDB[("Transaction History Store<br/>(read-optimized / 7-year retention)")]
-        CACHE[("Redis<br/>balance cache / idempotency key / rate limit")]
-        ARCHIVE[("S3 + Glacier<br/>long-term audit log storage")]
+        DDB[("<b>DynamoDB — source of truth (money)</b><br/>balance shards + full ledger (~12.6B rows/yr)<br/>append-only, 7-year, by account_id<br/>atomic via TransactWriteItems")]
+        LEDGERDB[("PostgreSQL (Aurora)<br/>metadata: users / transfers meta / events / idempotency<br/>+ balance <i>display cache</i> (NOT authoritative)")]
+        CACHE[("Redis<br/>cache / rate limit")]
+        ARCHIVE[("S3 + Glacier<br/>long-term audit / DynamoDB export")]
     end
 
     subgraph External["External Integrations"]
@@ -41,28 +40,30 @@ graph TB
 
     MOBILE --> CDN --> WAF --> APIGW
     APIGW -->|JWT verify| AUTH
-    APIGW --> TRANSFER
-    APIGW --> TXHIST
-    APIGW --> ACCOUNT
+    APIGW -->|sync: create + debit| PAYMENTS
 
-    TRANSFER --> USER
-    TRANSFER --> FRAUD
-    TRANSFER --> ACCOUNT
-    TRANSFER -->|high risk| ML
-    TRANSFER --> AML
-    TRANSFER --> BANK
-    TRANSFER --> MQ
+    PAYMENTS --> USER
+    PAYMENTS --> CACHE
+    PAYMENTS -->|balance + ledger<br/>atomic TransactWriteItems| DDB
+    PAYMENTS -.balance / history read.-> DDB
+    PAYMENTS -->|metadata / transfers / events| LEDGERDB
+    PAYMENTS -->|fire event| MQ
 
-    ACCOUNT --> LEDGERDB
-    ACCOUNT --> CACHE
-    MQ --> TXHIST
-    MQ --> NOTIFY
-    TXHIST --> TXDB
-    LEDGERDB -.CDC.-> ARCHIVE
+    MQ -->|drive workflow| WF
+    WF --> FRAUD
+    WF -->|moratorium then settle| PAYMENTS
+    WF --> BANK
+    WF -->|notify both parties| NOTIFY
+
+    FRAUD -->|high risk| ML
+    FRAUD --> AML
+
+    DDB -->|DynamoDB Streams<br/>refresh balance cache| LEDGERDB
+    DDB -.export.-> ARCHIVE
 
     classDef scope fill:#e3f2fd,stroke:#1565c0,stroke-width:2px;
     classDef ext fill:#fff3e0,stroke:#e65100,stroke-width:1px;
     classDef data fill:#f1f8e9,stroke:#33691e,stroke-width:1px;
-    class TRANSFER,ACCOUNT,USER,TXHIST,NOTIFY,FRAUD scope;
+    class PAYMENTS,WF,USER,NOTIFY,FRAUD scope;
     class ML,AML,BANK,AUTH ext;
-    class LEDGERDB,TXDB,CACHE,ARCHIVE data;
+    class DDB,LEDGERDB,CACHE,ARCHIVE data;
