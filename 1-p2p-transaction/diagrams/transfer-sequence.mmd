@@ -25,7 +25,7 @@ sequenceDiagram
         P->>R: 日次/取引限度チェック ($500 / $2,500)
         P->>U: resolve(email/phone) → recipientId
         Note over P,DDB: 資金を予約 — 条件付き UpdateItem (台帳記帳なし, エスクローなし)
-        P->>DDB: 送金者残高: held += 金額<br/>条件: available - held >= 金額 (満たさねば422残高不足)
+        P->>DDB: 送金者残高: held += 金額, version += 1<br/>条件: available - held >= 金額 (満たさねば422残高不足)
         DDB-->>P: OK (available据え置き — 実際のお金はまだ動かない)
         P-->>C: 200 OK (transfer_id, status=DEBITED, 見た目の残高は減少)
         P->>MQ: TransferRequested
@@ -52,9 +52,12 @@ sequenceDiagram
         F-->>P: ALLOW
         Note over P: (2) モラトリアム — settle_after まで待機し取消可能にする
         P->>P: settle_after まで待機 (取消可能な期間)
-        Note over P,DDB: (3) 決済 — ここで実際にお金が動く (1回の TransactWriteItems)
-        P->>DDB: 送金者: available -= 金額, held -= 金額 + DEBIT台帳エントリ追記
-        P->>DDB: 受取人: available += 金額 + CREDIT台帳エントリ追記<br/>条件: idempotency_key が未決済
+        Note over P,DDB: (3) 決済 — お金が動く (1回の TransactWriteItems, 楽観ロック)
+        P->>DDB: 送金者・受取人の残高アイテムを読む → version Vs, Vr
+        P->>DDB: 送金者更新: available-=金額, held-=金額, version=Vs+1<br/>ConditionExpression: version = Vs
+        P->>DDB: 受取人更新: available+=金額, version=Vr+1<br/>ConditionExpression: version = Vr
+        P->>DDB: DEBIT + CREDIT 台帳エントリput (条件: idempotency_key 未決済)
+        DDB-->>P: OK (または TransactionCanceledException → version再読込しリトライ)
         P->>PG: transfers.status = SETTLED
         P->>MQ: TransferSettled
     end

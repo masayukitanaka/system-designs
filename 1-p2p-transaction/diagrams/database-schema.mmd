@@ -54,7 +54,8 @@ erDiagram
         string partition_key "ACCOUNT-id"
         bigint available_minor "実残高 (SETTLE時に減算)"
         bigint held_minor "処理中送金の保留額 (POST時に設定)"
-        bigint version "条件付き書込の楽観ロック"
+        bigint version "楽観ロック: 全書込で ConditionExpression version = expected, version+1 に更新"
+        timestamp updated_at "最終更新時刻"
         string note "[DynamoDB — 正の残高; available - held = 利用可能]"
     }
 
@@ -66,6 +67,8 @@ erDiagram
         string idempotency_key "二重処理ガード"
         string type "DEBIT | CREDIT | REVERSAL"
         bigint amount_minor "符号付 (+credit / -debit)"
-        bigint balance_after "決済後の利用可能残高スナップショット"
+        bigint balance_after "このエントリ適用後の利用可能残高"
+        bigint balance_version "このエントリがコミットした BALANCE_DDB の version"
+        timestamp created_at "決済時刻 (追記専用)"
         string note "[DynamoDB — SETTLE時のみ追記, 7年]"
     }

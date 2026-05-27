@@ -25,7 +25,7 @@ sequenceDiagram
         P->>R: daily/per-txn limit check ($500 / $2,500)
         P->>U: resolve(email/phone) → recipientId
         Note over P,DDB: reserve funds — conditional UpdateItem (no ledger entry, no escrow)
-        P->>DDB: sender balance: held += amount<br/>cond: available - held >= amount (else 422 insufficient)
+        P->>DDB: sender balance: held += amount, version += 1<br/>cond: available - held >= amount (else 422 insufficient)
         DDB-->>P: OK (available unchanged — real money not moved yet)
         P-->>C: 200 OK (transfer_id, status=DEBITED, display balance reduced)
         P->>MQ: TransferRequested
@@ -52,9 +52,12 @@ sequenceDiagram
         F-->>P: ALLOW
         Note over P: (2) moratorium — wait settle_after so the transfer can be cancelled
         P->>P: wait until settle_after (cancellable window)
-        Note over P,DDB: (3) SETTLEMENT — money actually moves now (one TransactWriteItems)
-        P->>DDB: sender: available -= amount, held -= amount + append DEBIT ledger entry
-        P->>DDB: recipient: available += amount + append CREDIT ledger entry<br/>cond: idempotency_key not settled
+        Note over P,DDB: (3) SETTLEMENT — money moves now (one TransactWriteItems, optimistic lock)
+        P->>DDB: read sender & recipient balance items → versions Vs, Vr
+        P->>DDB: Update sender: available-=amt, held-=amt, version=Vs+1<br/>ConditionExpression: version = Vs
+        P->>DDB: Update recipient: available+=amt, version=Vr+1<br/>ConditionExpression: version = Vr
+        P->>DDB: Put DEBIT + CREDIT ledger entries (cond: idempotency_key not settled)
+        DDB-->>P: OK (or TransactionCanceledException → re-read versions, retry)
         P->>PG: transfers.status = SETTLED
         P->>MQ: TransferSettled
     end

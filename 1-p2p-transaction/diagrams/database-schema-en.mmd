@@ -54,7 +54,8 @@ erDiagram
         string partition_key "ACCOUNT-id"
         bigint available_minor "real balance (decremented at SETTLE)"
         bigint held_minor "reserved by in-flight transfers (set at POST)"
-        bigint version "optimistic lock for conditional writes"
+        bigint version "OPTIMISTIC LOCK: every write ConditionExpression version = expected, sets version+1"
+        timestamp updated_at "last mutation time"
         string note "[DynamoDB — authoritative balance; available - held = spendable]"
     }
 
@@ -66,6 +67,8 @@ erDiagram
         string idempotency_key "guards double-processing"
         string type "DEBIT | CREDIT | REVERSAL"
         bigint amount_minor "signed (+credit / -debit)"
-        bigint balance_after "post-settlement available balance snapshot"
+        bigint balance_after "available balance AFTER this entry"
+        bigint balance_version "version of BALANCE_DDB this entry committed against"
+        timestamp created_at "settlement time (append-only)"
         string note "[DynamoDB — append-only at SETTLE only, 7y]"
     }
