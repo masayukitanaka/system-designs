@@ -12,7 +12,8 @@ graph TB
 
             subgraph NSCore["Namespace: core"]
                 direction LR
-                TPOD["payments-svc<br/>Deployment x N<br/>(HPA: CPU/TPS)<br/>transfer+ledger+history"]
+                TPOD["transfer-svc<br/>Deployment x N<br/>(HPA: CPU/TPS)<br/>sync receive"]
+                LPOD["ledger-svc<br/>Deployment x N<br/>balance + ledger + meta<br/>+ Temporal workflows / workers<br/>(sole money + workflow owner)"]
                 FPOD["fraud-svc<br/>Deployment x N"]
                 UPOD["user-svc<br/>Deployment x N"]
                 NPOD["notify-svc<br/>Deployment x N"]
@@ -30,35 +31,41 @@ graph TB
             end
         end
 
-        subgraph Managed["Managed Data Services (outside cluster)"]
+        subgraph Managed["Managed Services (outside cluster)"]
             DDB[("DynamoDB<br/>balance + full ledger<br/>(money source of truth)")]
             AURORA[("Aurora PostgreSQL<br/>metadata + balance cache")]
             REDIS[("ElastiCache Redis<br/>(cluster mode)")]
             MSK["MSK (Kafka)"]
+            TEMPORAL["Temporal Service<br/>(Temporal Cloud or self-hosted)<br/>durable state, timers, retries"]
             S3B["S3 / Glacier"]
         end
     end
 
     U --> R53 --> WAFCF --> ING
-    ING --> TPOD & FPOD & UPOD
+    ING --> TPOD
     TPOD -.mTLS.- MESH
-    TPOD -->|balance + ledger| DDB
-    TPOD -->|metadata| AURORA
+    TPOD --> UPOD
     TPOD --> REDIS
-    TPOD --> FPOD & UPOD
-    TPOD --> MSK
+    TPOD -->|sync: hold + accept| LPOD
+    TPOD -->|fire TransferRequested| MSK
+    LPOD -->|hold / settle balance + ledger| DDB
+    LPOD -->|meta / idempotency / status| AURORA
+    MSK -->|TransferRequested| LPOD
+    LPOD <-->|start workflow / signals / poll tasks| TEMPORAL
+    LPOD -->|fraud Activity| FPOD
+    LPOD -->|notify| MSK
     MSK --> NPOD
-    TPOD -.balance / history read.-> DDB
+    LPOD -.balance / history read.-> DDB
     DDB -->|Streams: refresh cache| AURORA
-    ESO -.inject secrets.-> TPOD & FPOD & UPOD
-    TPOD & FPOD & UPOD & NPOD --> OTEL
+    ESO -.inject secrets.-> TPOD & LPOD & FPOD & UPOD
+    TPOD & LPOD & FPOD & UPOD & NPOD --> OTEL
     OTEL --> PROM
-    TPOD & FPOD & UPOD --> FLUENT
+    TPOD & LPOD & FPOD & UPOD --> FLUENT
     DDB -.export.-> S3B
 
     classDef pod fill:#e3f2fd,stroke:#1565c0,stroke-width:1px;
     classDef infra fill:#ede7f6,stroke:#4527a0,stroke-width:1px;
     classDef data fill:#f1f8e9,stroke:#33691e,stroke-width:1px;
-    class TPOD,FPOD,UPOD,NPOD pod;
+    class TPOD,LPOD,FPOD,UPOD,NPOD pod;
     class MESH,ESO,PROM,OTEL,FLUENT,ING infra;
-    class AURORA,REDIS,MSK,S3B data;
+    class AURORA,REDIS,MSK,TEMPORAL,S3B data;

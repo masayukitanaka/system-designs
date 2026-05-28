@@ -14,15 +14,19 @@ graph TB
     end
 
     subgraph Core["コアサービス (本設計のスコープ)"]
-        PAYMENTS["<b>Payments Service</b><br/>同期: 送金者をhold (お金は動かさない), 200返却, イベント発火<br/>決済: お金を動かす + 台帳追記<br/>+ 冪等性 + 残高/履歴の読取 (DynamoDBから)<br/><i>(金額の真実はDynamoDB)</i>"]
-        WF["Settlement Workflow<br/>ステートマシン: fraud → モラトリアム<br/>→ 振込確定 → 通知<br/><i>(複雑なら Step Functions)</i>"]
+        TRANSFER["<b>Transfer Service</b><br/>同期受付: Ledgerをコールしてhold,<br/>TransferRequested発火, 受付完了+残高を返却<br/>(薄いオーケストレーション, 金額データを持たない)"]
+        LEDGER["<b>Ledger Service</b><br/>金額+メタ+ワークフローの唯一の所有者<br/>残高(available/held)+台帳(DynamoDB)<br/>+ transfersメタ/冪等性/status(PostgreSQL)<br/><b>TransferRequested を消費 → Temporalワークフロー実行</b><br/>fraud Activity → モラトリアム(durable timer) → 決済(内部) → 通知"]
         USER["User Directory Service<br/>電話/Email → userId 解決"]
         NOTIFY["Notification Service<br/>Push / SMS / Email"]
         FRAUD["Fraud Rule Engine<br/>fraud / AML チェック (+ 人手承認)"]
     end
 
+    subgraph Orch["ワークフロー オーケストレーション"]
+        TSERVER["Temporal Service<br/>(状態・タイマー・リトライを永続管理)"]
+    end
+
     subgraph Async["非同期基盤"]
-        MQ["Kafka / SQS<br/>イベントバス"]
+        MQ["Kafka / SQS<br/>イベントバス (TransferRequested, 通知)"]
     end
 
     subgraph Data["データ層"]
@@ -40,20 +44,23 @@ graph TB
 
     MOBILE --> CDN --> WAF --> APIGW
     APIGW -->|JWT検証| AUTH
-    APIGW -->|同期: 作成 + hold| PAYMENTS
+    APIGW -->|同期: 送金作成| TRANSFER
 
-    PAYMENTS --> USER
-    PAYMENTS --> CACHE
-    PAYMENTS -->|残高 + 台帳<br/>原子的 TransactWriteItems| DDB
-    PAYMENTS -.残高 / 履歴 読取.-> DDB
-    PAYMENTS -->|メタデータ / transfers / events| LEDGERDB
-    PAYMENTS -->|イベント発火| MQ
+    TRANSFER --> USER
+    TRANSFER --> CACHE
+    TRANSFER -->|同期: hold + 受付| LEDGER
+    TRANSFER -->|TransferRequested 発火| MQ
 
-    MQ -->|ワークフロー駆動| WF
-    WF --> FRAUD
-    WF -->|モラトリアム後に振込確定| PAYMENTS
-    WF --> BANK
-    WF -->|両者へ通知| NOTIFY
+    LEDGER -->|hold + 決済 残高 + 台帳<br/>条件付き UpdateItem / TransactWriteItems| DDB
+    LEDGER -.残高 / 履歴 読取.-> DDB
+    LEDGER -->|transfersメタ / 冪等性 / status| LEDGERDB
+
+    MQ -->|TransferRequested| LEDGER
+    LEDGER <-->|ワークフロー起動 / signal / タスクpoll| TSERVER
+    LEDGER -->|fraud / AML Activity| FRAUD
+    LEDGER --> BANK
+    LEDGER -->|両者へ通知| MQ
+    MQ --> NOTIFY
 
     FRAUD -->|高リスク時| ML
     FRAUD --> AML
@@ -64,6 +71,8 @@ graph TB
     classDef scope fill:#e3f2fd,stroke:#1565c0,stroke-width:2px;
     classDef ext fill:#fff3e0,stroke:#e65100,stroke-width:1px;
     classDef data fill:#f1f8e9,stroke:#33691e,stroke-width:1px;
-    class PAYMENTS,WF,USER,NOTIFY,FRAUD scope;
+    classDef orch fill:#ede7f6,stroke:#4527a0,stroke-width:2px;
+    class TRANSFER,LEDGER,USER,NOTIFY,FRAUD scope;
     class ML,AML,BANK,AUTH ext;
     class DDB,LEDGERDB,CACHE,ARCHIVE data;
+    class TSERVER orch;

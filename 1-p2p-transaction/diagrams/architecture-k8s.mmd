@@ -12,7 +12,8 @@ graph TB
 
             subgraph NSCore["Namespace: core"]
                 direction LR
-                TPOD["payments-svc<br/>Deployment x N<br/>(HPA: CPU/TPS)<br/>送金+台帳+履歴"]
+                TPOD["transfer-svc<br/>Deployment x N<br/>(HPA: CPU/TPS)<br/>同期受付"]
+                LPOD["ledger-svc<br/>Deployment x N<br/>残高 + 台帳 + メタ<br/>+ Temporalワークフロー / Worker<br/>(金額+ワークフローの唯一の所有者)"]
                 FPOD["fraud-svc<br/>Deployment x N"]
                 UPOD["user-svc<br/>Deployment x N"]
                 NPOD["notify-svc<br/>Deployment x N"]
@@ -30,35 +31,41 @@ graph TB
             end
         end
 
-        subgraph Managed["マネージドデータサービス (クラスタ外)"]
+        subgraph Managed["マネージドサービス (クラスタ外)"]
             DDB[("DynamoDB<br/>残高 + 全台帳<br/>(金額の真実)")]
             AURORA[("Aurora PostgreSQL<br/>メタデータ + 残高キャッシュ")]
             REDIS[("ElastiCache Redis<br/>(クラスタモード)")]
             MSK["MSK (Kafka)"]
+            TEMPORAL["Temporal Service<br/>(Temporal Cloud / セルフホスト)<br/>状態・タイマー・リトライを永続管理"]
             S3B["S3 / Glacier"]
         end
     end
 
     U --> R53 --> WAFCF --> ING
-    ING --> TPOD & FPOD & UPOD
+    ING --> TPOD
     TPOD -.mTLS.- MESH
-    TPOD -->|残高 + 台帳| DDB
-    TPOD -->|メタデータ| AURORA
+    TPOD --> UPOD
     TPOD --> REDIS
-    TPOD --> FPOD & UPOD
-    TPOD --> MSK
+    TPOD -->|同期: hold + 受付| LPOD
+    TPOD -->|TransferRequested 発火| MSK
+    LPOD -->|hold / 決済 残高 + 台帳| DDB
+    LPOD -->|メタ / 冪等性 / status| AURORA
+    MSK -->|TransferRequested| LPOD
+    LPOD <-->|ワークフロー起動 / signal / タスクpoll| TEMPORAL
+    LPOD -->|fraud Activity| FPOD
+    LPOD -->|通知| MSK
     MSK --> NPOD
-    TPOD -.残高 / 履歴 読取.-> DDB
+    LPOD -.残高 / 履歴 読取.-> DDB
     DDB -->|Streams: キャッシュ更新| AURORA
-    ESO -.シークレット注入.-> TPOD & FPOD & UPOD
-    TPOD & FPOD & UPOD & NPOD --> OTEL
+    ESO -.シークレット注入.-> TPOD & LPOD & FPOD & UPOD
+    TPOD & LPOD & FPOD & UPOD & NPOD --> OTEL
     OTEL --> PROM
-    TPOD & FPOD & UPOD --> FLUENT
+    TPOD & LPOD & FPOD & UPOD --> FLUENT
     DDB -.エクスポート.-> S3B
 
     classDef pod fill:#e3f2fd,stroke:#1565c0,stroke-width:1px;
     classDef infra fill:#ede7f6,stroke:#4527a0,stroke-width:1px;
     classDef data fill:#f1f8e9,stroke:#33691e,stroke-width:1px;
-    class TPOD,FPOD,UPOD,NPOD pod;
+    class TPOD,LPOD,FPOD,UPOD,NPOD pod;
     class MESH,ESO,PROM,OTEL,FLUENT,ING infra;
-    class AURORA,REDIS,MSK,S3B data;
+    class AURORA,REDIS,MSK,TEMPORAL,S3B data;

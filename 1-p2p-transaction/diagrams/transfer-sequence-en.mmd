@@ -2,33 +2,35 @@ sequenceDiagram
     autonumber
     participant C as Client
     participant GW as API Gateway
-    participant P as Payments Service
-    participant R as Redis (rate limit)
+    participant TR as Transfer Service
+    participant LG as Ledger Service (workflow + activities)
     participant DDB as DynamoDB (balance + ledger — money truth)
     participant PG as PostgreSQL (metadata + balance cache)
     participant MQ as Event Bus (Kafka)
-    participant U as User Directory
+    participant TS as Temporal Service
     participant F as Fraud Engine
     participant X as ML / AML APIs (external)
     participant N as Notification
 
     rect rgb(225, 240, 255)
-    Note over C,MQ: SYNCHRONOUS — reserve (hold) only, NO money moved yet, return 200 + event
+    Note over C,MQ: SYNCHRONOUS — Transfer calls Ledger to hold, fires event, returns accepted + balance
     C->>GW: POST /v1/transfers (Idempotency-Key, JWT)
     GW->>GW: JWT verify / rate limit
-    GW->>P: createTransfer(req)
-    P->>PG: write transfers meta (status=DEBITED, amount, note, idempotency_key)
+    GW->>TR: createTransfer(req)
+    TR->>TR: daily/per-txn limit check ($500 / $2,500)
+    TR->>LG: hold(sender, recipient, amount, idempotency_key)
+    LG->>PG: write transfers meta (status=DEBITED, amount, idempotency_key)
     alt key exists (duplicate)
-        PG-->>P: conflict → return stored response
-        P-->>C: 200 (same as before)
+        PG-->>LG: conflict → stored response
+        LG-->>TR: existing result
+        TR-->>C: 200 (same as before)
     else new request
-        P->>R: daily/per-txn limit check ($500 / $2,500)
-        P->>U: resolve(email/phone) → recipientId
-        Note over P,DDB: reserve funds — conditional UpdateItem (no ledger entry, no escrow)
-        P->>DDB: sender balance: held += amount, version += 1<br/>cond: available - held >= amount (else 422 insufficient)
-        DDB-->>P: OK (available unchanged — real money not moved yet)
-        P-->>C: 200 OK (transfer_id, status=DEBITED, display balance reduced)
-        P->>MQ: TransferRequested
+        Note over LG,DDB: reserve funds — conditional UpdateItem (no ledger entry, no escrow)
+        LG->>DDB: sender balance: held += amount, version += 1<br/>cond: available - held >= amount (else 422 insufficient)
+        DDB-->>LG: OK (available unchanged — real money not moved yet)
+        LG-->>TR: accepted (transfer_id, new available/held)
+        TR->>MQ: fire TransferRequested
+        TR-->>C: 200 OK (transfer_id, status=DEBITED, balance)
     end
     end
 
@@ -37,29 +39,32 @@ sequenceDiagram
     DDB-->>PG: stream balance change → update balance_cache_minor
     end
 
-    rect rgb(235, 255, 235)
-    Note over MQ,N: ASYNCHRONOUS WORKFLOW (state machine — Step Functions if it grows complex)
-    MQ-->>P: (1) fraud step
-    P->>F: fraud / AML check (suspicious merchant, etc.)
+    rect rgb(237, 231, 246)
+    Note over MQ,N: ASYNC — Ledger Service runs the Temporal workflow itself (durable: state, timers, retries)
+    MQ-->>LG: TransferRequested (consumed by Ledger)
+    LG->>TS: StartWorkflow SettlementWorkflow(transfer_id)
+    Note over LG,F: (1) fraud Activity (auto-retry, timeout)
+    LG->>F: fraud / AML check
     F->>X: AML screening (+ ML scoring)
     X-->>F: result
-    alt denied / cancelled during moratorium
-        F-->>P: REVIEW or DENY (or user cancels)
-        Note over P,DDB: just release the hold — no money ever moved
-        P->>DDB: sender balance: held -= amount
-        P->>PG: transfers.status = CANCELLED
-    else passed
-        F-->>P: ALLOW
-        Note over P: (2) moratorium — wait settle_after so the transfer can be cancelled
-        P->>P: wait until settle_after (cancellable window)
-        Note over P,DDB: (3) SETTLEMENT — money moves now (one TransactWriteItems, optimistic lock)
-        P->>DDB: read sender & recipient balance items → versions Vs, Vr
-        P->>DDB: Update sender: available-=amt, held-=amt, version=Vs+1<br/>ConditionExpression: version = Vs
-        P->>DDB: Update recipient: available+=amt, version=Vr+1<br/>ConditionExpression: version = Vr
-        P->>DDB: Put DEBIT + CREDIT ledger entries (cond: idempotency_key not settled)
-        DDB-->>P: OK (or TransactionCanceledException → re-read versions, retry)
-        P->>PG: transfers.status = SETTLED
-        P->>MQ: TransferSettled
+    F-->>LG: ALLOW / REVIEW / DENY
+    alt DENY  (or cancel Signal during moratorium)
+        Note over LG,DDB: release the hold — no money ever moved (local Activity)
+        LG->>DDB: sender balance: held -= amount (+ version bump)
+        LG->>PG: transfers.status = CANCELLED
+    else ALLOW
+        Note over LG,TS: (2) moratorium = workflow.Sleep(settle_after) — DURABLE TIMER<br/>cancel Signal interrupts the timer → releaseHold
+        LG->>TS: start durable timer until settle_after
+        TS-->>LG: timer fired (settle_after reached)
+        Note over LG,DDB: (3) settle Activity — local to Ledger (one TransactWriteItems, optimistic lock)
+        LG->>DDB: read sender & recipient balance → versions Vs, Vr
+        LG->>DDB: Update sender: available-=amt, held-=amt, version=Vs+1 (cond version=Vs)
+        LG->>DDB: Update recipient: available+=amt, version=Vr+1 (cond version=Vr)
+        LG->>DDB: Put DEBIT + CREDIT ledger entries (cond: idempotency_key not settled)
+        DDB-->>LG: OK (or TransactionCanceledException → activity retries)
+        LG->>PG: transfers.status = SETTLED
+        Note over LG,N: (4) notify Activity
+        LG->>MQ: publish TransferSettled
+        MQ-->>N: notify sender & recipient (Push/SMS/Email)
     end
-    MQ-->>N: (4) notify sender & recipient (Push/SMS/Email)
     end

@@ -14,15 +14,19 @@ graph TB
     end
 
     subgraph Core["Core Services (scope of this design)"]
-        PAYMENTS["<b>Payments Service</b><br/>SYNC: hold sender funds (no money moved), return 200, fire event<br/>SETTLE: move money + append ledger<br/>+ idempotency + balance/history reads (from DynamoDB)<br/><i>(money truth in DynamoDB)</i>"]
-        WF["Settlement Workflow<br/>state machine: fraud → moratorium<br/>→ settle → notify<br/><i>(Step Functions if complex)</i>"]
+        TRANSFER["<b>Transfer Service</b><br/>SYNC receive: calls Ledger to hold,<br/>fires TransferRequested, returns accepted + balance<br/>(thin orchestration, owns no money data)"]
+        LEDGER["<b>Ledger Service</b><br/>SOLE owner of money + metadata + workflow<br/>balance (available/held) + ledger (DynamoDB)<br/>+ transfers meta / idempotency / status (PostgreSQL)<br/><b>Consumes TransferRequested → runs Temporal workflow</b><br/>fraud Activity → moratorium (durable timer) → settle (local) → notify"]
         USER["User Directory Service<br/>phone/email → userId resolution"]
         NOTIFY["Notification Service<br/>Push / SMS / Email"]
         FRAUD["Fraud Rule Engine<br/>fraud / AML checks (+ manual review)"]
     end
 
+    subgraph Orch["Workflow Orchestration"]
+        TSERVER["Temporal Service<br/>(durable state, timers, retries)"]
+    end
+
     subgraph Async["Async Infrastructure"]
-        MQ["Kafka / SQS<br/>event bus"]
+        MQ["Kafka / SQS<br/>event bus (TransferRequested, notifications)"]
     end
 
     subgraph Data["Data Layer"]
@@ -40,20 +44,23 @@ graph TB
 
     MOBILE --> CDN --> WAF --> APIGW
     APIGW -->|JWT verify| AUTH
-    APIGW -->|sync: create + hold| PAYMENTS
+    APIGW -->|sync: create transfer| TRANSFER
 
-    PAYMENTS --> USER
-    PAYMENTS --> CACHE
-    PAYMENTS -->|balance + ledger<br/>atomic TransactWriteItems| DDB
-    PAYMENTS -.balance / history read.-> DDB
-    PAYMENTS -->|metadata / transfers / events| LEDGERDB
-    PAYMENTS -->|fire event| MQ
+    TRANSFER --> USER
+    TRANSFER --> CACHE
+    TRANSFER -->|sync: hold + accept| LEDGER
+    TRANSFER -->|fire TransferRequested| MQ
 
-    MQ -->|drive workflow| WF
-    WF --> FRAUD
-    WF -->|moratorium then settle| PAYMENTS
-    WF --> BANK
-    WF -->|notify both parties| NOTIFY
+    LEDGER -->|hold + settle balance + ledger<br/>conditional UpdateItem / TransactWriteItems| DDB
+    LEDGER -.balance / history read.-> DDB
+    LEDGER -->|transfers meta / idempotency / status| LEDGERDB
+
+    MQ -->|TransferRequested| LEDGER
+    LEDGER <-->|start workflow / signals / poll tasks| TSERVER
+    LEDGER -->|fraud / AML Activity| FRAUD
+    LEDGER --> BANK
+    LEDGER -->|notify both parties| MQ
+    MQ --> NOTIFY
 
     FRAUD -->|high risk| ML
     FRAUD --> AML
@@ -64,6 +71,8 @@ graph TB
     classDef scope fill:#e3f2fd,stroke:#1565c0,stroke-width:2px;
     classDef ext fill:#fff3e0,stroke:#e65100,stroke-width:1px;
     classDef data fill:#f1f8e9,stroke:#33691e,stroke-width:1px;
-    class PAYMENTS,WF,USER,NOTIFY,FRAUD scope;
+    classDef orch fill:#ede7f6,stroke:#4527a0,stroke-width:2px;
+    class TRANSFER,LEDGER,USER,NOTIFY,FRAUD scope;
     class ML,AML,BANK,AUTH ext;
     class DDB,LEDGERDB,CACHE,ARCHIVE data;
+    class TSERVER orch;

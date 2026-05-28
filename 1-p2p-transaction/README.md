@@ -276,36 +276,40 @@ This document progressively elaborates in the order "overview → design princip
 
 ![Architecture Overview](./architecture-overview.png)
 
-Requests pass through the edge layer `CloudFront → WAF → API Gateway/ALB` and, after JWT verification, are routed to the appropriate service. The transfer flow, the double-entry ledger, and history queries are all handled inside a single **Payments Service** within strongly consistent transactions. Notifications, recipient resolution, and fraud checks are delegated to independent services, and notifications/history fan-out are made asynchronous via the event bus.
+Requests pass through the edge layer `CloudFront → WAF → API Gateway/ALB` and, after JWT verification, reach the **Transfer Service** (synchronous front door). Transfer Service calls the **Ledger Service** to place the hold, then fires a `TransferRequested` event and returns acceptance + balance to the client. The Ledger Service is the **sole owner of money + money-metadata + the settlement workflow** (balances + ledger in DynamoDB, `transfers`/idempotency/status in PostgreSQL, and the Temporal workflow that drives the post-hold lifecycle). Ledger consumes `TransferRequested` from the event bus, starts a Temporal workflow, and runs fraud → moratorium → settlement → notify; the settlement Activity is **local to the Ledger Service** (no cross-service call back into itself).
 
 #### Service Decomposition Principle
-We do **not** split services along URL paths (e.g., one service per `/transfers`, `/transactions`, `/accounts`). Services are split along **transactional and data-ownership boundaries**, not API surface.
+We do **not** split services along URL paths. Services are split along **data-ownership and dependency-direction boundaries**.
 
-- The transfer flow, balance updates, the double-entry ledger, and transaction history all read and write the **same data** and must participate in the **same ACID transaction** (e.g., debit/credit and the `transfers` status update must be atomic). Splitting them would force distributed transactions / Sagas for the core money-movement path — accidental complexity with no benefit. → Therefore they are consolidated into a single **Payments Service**.
-- **Fraud Engine**, **User Directory**, and **Notification** are genuinely independent concerns (different data, different failure modes, different scaling profiles, callable in isolation) → they **remain separate services**.
+- **Ledger Service owns all money + money-metadata + the settlement workflow.** Every balance/ledger mutation and the `transfers` status row live behind one service, so the atomic writes (`TransactWriteItems`, hold) never cross a service boundary. The Temporal workflow that drives the post-hold lifecycle is **also owned by Ledger** — its Activities (settlement in particular) are local to the service, so there is no cross-service call back into the data owner.
+- **Transfer Service is a thin synchronous front** — limit checks, recipient resolution, a synchronous call into Ledger to hold, and it **fires the `TransferRequested` event**. It owns no money data.
+- **Fraud Engine**, **User Directory**, and **Notification** are genuinely independent concerns → separate services.
+
+> **Why this shape.** An earlier iteration carved the workflow into a separate Workflow Service that called back into the data owner to settle. That re-introduced a cross-service round-trip on the settlement Activity (Workflow → Ledger), which is the exact kind of inter-service back-call we were trying to avoid. Folding the workflow into the Ledger Service eliminates that: the settlement Activity becomes a **local** function call within Ledger, while the dependency direction across service boundaries stays clean — `Transfer → Ledger` for the sync hold; `Transfer →(event)→ Kafka → Ledger` to start the workflow; `Ledger → Fraud`; `Ledger → Kafka → Notification`. The synchronous initiator (Transfer) is never called back by the workflow, and the data owner (Ledger) keeps all of its money operations — sync hold, async settlement — under one transactional umbrella.
 
 #### Why This Split (vs Monolith / vs URL-based split)
 | Aspect | Decision |
 |--------|----------|
-| **Single transaction for money movement** | Transfer + ledger + history share data and must be atomic. Keep them in one **Payments Service** to use a single DB transaction instead of a distributed Saga |
-| **Fault isolation** | Keep Notification / Fraud separate so their failures never block the money-movement core (graceful degradation) |
-| **Independent scaling where it matters** | Read-heavy history is served from read replicas *within* Payments Service; Fraud/Notification scale on their own load profiles |
-| **Trade-off** | The Payments Service is larger (it owns reads and writes), but avoids distributed-transaction complexity on the critical path. Read scaling is handled by CQRS read replicas, not by carving out a separate service |
+| **One owner of the money + workflow** | All balance/ledger/`transfers` writes and the Temporal workflow live behind **Ledger Service**, so the settlement Activity is a local call — no cross-service round-trip back into the data owner |
+| **No cycle across the sync initiator** | Transfer holds and fires the event; Ledger consumes it and runs the workflow. The synchronous initiator (Transfer) is never called back, so request-time and workflow-time concerns stay decoupled |
+| **Fault isolation** | Fraud / Notification failures never block the synchronous accept path (the hold), which only needs Transfer + Ledger |
+| **Trade-off** | Ledger is bigger — it owns the workflow plus the data. We accept it because (a) the settlement Activity must touch the same data anyway, so keeping them together makes the Activity a local call, and (b) the cross-service split caused a back-call we did not need |
 
-> **Incremental approach**: Start with **Payments Service** as the core, plus the independent **Fraud / User Directory / Notification** services. Split further only when a real transactional/scaling boundary demands it — never merely because a different URL prefix exists.
+> **Incremental approach**: Split only where a real boundary exists. Here the boundaries are concrete — data ownership + workflow (Ledger), a short sync path (Transfer), and the independent Fraud / User Directory / Notification — never merely because a different URL prefix exists.
 
 #### Responsibilities of Key Components
 | Component | Responsibility |
 |-----------|----------------|
 | **API Gateway / ALB** | JWT verification, rate limiting, routing, TLS termination |
-| **Payments Service** | The money-movement core. Orchestrates the transfer flow, idempotency control, limit checks, invokes fraud detection; performs strongly consistent balance updates and appends to the double-entry ledger (**the sole owner of balance updates**); serves transaction history via CQRS reads (7-year retention). All money-movement state lives here in one transactional boundary |
+| **Transfer Service** | Synchronous front door: limit checks, recipient resolution, calls Ledger to hold, **fires `TransferRequested`**, returns acceptance + balance to the client. Owns no money data |
+| **Ledger Service** | **Sole owner of money + money-metadata + the settlement workflow**: balances (`available`/`held`) and the ledger in DynamoDB, plus `transfers`/idempotency/`status` in PostgreSQL. Performs the hold and the settlement writes; exposes `hold`/`releaseHold` and balance reads (the synchronous API). Also **consumes `TransferRequested` from Kafka and runs the Temporal workflow** (fraud → moratorium → settlement → notify); the settlement Activity is a **local call** inside this service. The only writer of balances |
 | **User Directory Service** | Resolving phone/email → `user_id` (recipient identification) |
 | **Notification Service** | Push/SMS/Email notifications (asynchronous, eventually consistent) |
-| **Fraud Rule Engine** | Inline rule-based fraud checks. **Owns all integrations with external risk APIs** — calls the ML fraud-scoring API and the AML screening API on behalf of the Payments Service |
-| **Event Bus (Kafka/SQS)** | Asynchronous inter-service communication. Event delivery from the outbox |
+| **Fraud Rule Engine** | Inline rule-based fraud checks. **Owns all integrations with external risk APIs** — calls the ML fraud-scoring API and the AML screening API on behalf of the Ledger Service's fraud Activity |
+| **Event Bus (Kafka/SQS)** | Asynchronous inter-service messaging — `TransferRequested`, notification fan-out, downstream consumers |
 
 #### External Integrations
-External risk APIs are **not called directly by the Payments Service**; they are accessed through the **Fraud Service**, which acts as the single integration point for risk/compliance. This keeps fraud/AML concerns (vendor SDKs, credentials, fallback policy, false-positive handling) out of the money-movement core.
+External risk APIs are **not called directly by the workflow**; they are accessed through the **Fraud Service**, which acts as the single integration point for risk/compliance. This keeps fraud/AML concerns (vendor SDKs, credentials, fallback policy, false-positive handling) out of the rest of the system.
 
 - **ML fraud scoring API**: Called by the Fraud Service, synchronously only when judged high-risk (falls back on timeout)
 - **AML screening API**: Called by the Fraud Service for sanctions-list matching
@@ -366,7 +370,7 @@ Core services are deployed on **Amazon EKS** on AWS. Data stores (Aurora / Elast
 | **user_identifiers** | PostgreSQL | Email/phone → userId | Unique index on `value`. Used for recipient resolution |
 | **accounts (meta)** | PostgreSQL | Account metadata + balance **cache** | currency, etc. `balance_cache_minor` is a **display cache only** (refreshed from DynamoDB Streams), never authoritative, never used for the debit decision |
 | **transfers (meta)** | PostgreSQL | Transfer metadata / search / workflow | Lifecycle `status` (`DEBITED → FRAUD_REVIEW → MORATORIUM → SETTLED`, or `CANCELLED`/`REVERSED`), searchable `note`, `settle_after`. Unique constraint on `idempotency_key`. **Money amounts live in DynamoDB, not here** |
-| **transfer_events** | PostgreSQL | Workflow tracking | Each async step (`FRAUD`/`MORATORIUM`/`SETTLE`/`NOTIFY`) and its state — the durable state of the settlement workflow |
+| **transfer_events** | PostgreSQL | Audit / read-side projection | A queryable record of each step (`FRAUD`/`MORATORIUM`/`SETTLE`/`NOTIFY`). The **authoritative** workflow state lives in Temporal's event history; this table is a projection for app queries, dashboards, and audit |
 | **idempotency_keys** | PostgreSQL | Idempotency control | Request hash + response. (The DynamoDB transaction also carries its own idempotency guard item — see below.) |
 
 #### Hold-then-settle (no escrow)
@@ -438,19 +442,21 @@ The synchronous response returns immediately after the sender's funds are **held
 
 The flow is deliberately split into a **short synchronous path** (so `POST /v1/transfers` returns fast) and an **asynchronous settlement workflow**.
 
-**Synchronous (`POST /v1/transfers` → 200 OK + event):**
-1. **Metadata + idempotency**: Write the `transfers` metadata row to PostgreSQL (unique constraint on `idempotency_key`); a duplicate conflicts and the stored response is returned.
-2. **Limit check** (e.g. $500/txn, $2,500/day) and **recipient resolution** happen here — cheap to reject early.
-3. **Hold only — in DynamoDB**: One conditional `UpdateItem` on the sender's balance item sets `held += amount` with condition `available - held >= amount`. `ConditionalCheckFailed` → insufficient funds, return 422 immediately. No ledger entry and no money movement yet. (Idempotency: the prior `transfers` metadata write keyed by `idempotency_key` makes a replayed POST return the stored response instead of holding twice.)
-4. Return `200 OK (status=DEBITED)` and publish `TransferRequested` to Kafka.
+The flow is deliberately split into a **short synchronous path** (`Transfer → Ledger`, so `POST /v1/transfers` returns fast) and an **asynchronous settlement workflow** owned and run by the **Ledger Service** on Temporal.
 
-**Asynchronous settlement workflow (state machine; AWS Step Functions if it grows complex):**
-1. **Fraud / AML check**: Suspicious-merchant and AML screening. A small fraction may require a **human approval flow**. On deny → **release the hold** (`held -= amount`, no ledger entry — money never moved) and set `transfers.status=CANCELLED`.
-2. **Moratorium**: Wait until `settle_after` so the user can still cancel the transfer (cancellable window). Cancel = release the hold, same as above.
-3. **Settlement (money actually moves now)**: One `TransactWriteItems` debits the sender (`available -= amount, held -= amount`, append DEBIT) and credits the recipient (`available += amount`, append CREDIT), conditioned on the Idempotency-Key not yet settled; update `transfers.status=SETTLED` in PostgreSQL.
-4. **Notification**: Notify both the sender and the recipient (Push/SMS/Email).
+**Synchronous (`POST /v1/transfers` → 200 OK):**
+1. **Transfer Service**: limit check (e.g. $500/txn, $2,500/day) and recipient resolution — cheap to reject early — then a synchronous call into Ledger Service to hold.
+2. **Ledger Service — metadata + idempotency**: write the `transfers` row to PostgreSQL (unique constraint on `idempotency_key`); a duplicate conflicts and the stored response is returned.
+3. **Ledger Service — hold only (DynamoDB)**: one conditional `UpdateItem` sets `held += amount` with condition `available - held >= amount`. `ConditionalCheckFailed` → insufficient funds, 422. No ledger entry, no money moved yet. Ledger returns acceptance + new balance to Transfer Service.
+4. **Transfer Service fires `TransferRequested`** (only after Ledger accepted) and returns `200 OK (status=DEBITED, balance)` to the client.
 
-> **Why this split?** The synchronous hold gives the sender immediate feedback and reserves the funds (the conditional `available - held >= amount` write prevents double-spend) **without moving money**, while deferring the actual transfer lets us run fraud/AML and offer a cancellation window. Because no money has moved until settlement, a cancellation is just releasing a hold — there is nothing to claw back. `transfer_events` (PostgreSQL) makes the workflow durable and resumable after a crash.
+**Asynchronous settlement — Ledger Service runs the Temporal workflow.** Ledger consumes `TransferRequested` and starts a **Temporal workflow**. Temporal persists its state, timers, and retries, so there is no hand-rolled state machine or in-process timer. Steps run as **Activities** (auto-retried with timeouts); the moratorium is a **durable timer**; cancellation is a **Signal**. The settlement and hold-release Activities are **local to the Ledger Service** — they read/write the same DynamoDB and PostgreSQL data the synchronous API does, but as in-process function calls rather than cross-service round-trips.
+1. **Fraud / AML check (Activity)**: Suspicious-merchant and AML screening (via Fraud Service). A small fraction may require a **human approval flow**. On deny → call Ledger to **release the hold** (`held -= amount`, no ledger entry — money never moved) and set `transfers.status=CANCELLED`.
+2. **Moratorium (durable timer)**: `workflow.Sleep` until `settle_after` so the user can still cancel. A **cancel Signal** interrupts the timer and releases the hold. Temporal owns the timer — no in-process sleep, no external poller; the workflow resumes when it fires, even across worker restarts.
+3. **Settlement Activity → Ledger Service (money actually moves now)**: Ledger runs one `TransactWriteItems` that debits the sender (`available -= amount, held -= amount`, append DEBIT) and credits the recipient (`available += amount`, append CREDIT), each balance update conditioned on its `version` and the Idempotency-Key not yet settled; sets `transfers.status=SETTLED`.
+4. **Notification (Activity)**: Publish `TransferSettled`; notify both the sender and the recipient (Push/SMS/Email).
+
+> **Why this split?** The synchronous hold gives the sender immediate feedback and reserves the funds (the conditional `available - held >= amount` write prevents double-spend) **without moving money**, while deferring the actual transfer lets us run fraud/AML and offer a cancellation window. Because no money has moved until settlement, a cancellation is just releasing a hold — there is nothing to claw back. Routing the workflow through an **event** (Transfer fires `TransferRequested`, Ledger consumes it) decouples the sync path from the long-running workflow without a cross-service back-call. **Temporal** makes the workflow durable and resumable after a crash, with the moratorium as a first-class durable timer.
 
 ---
 
@@ -465,7 +471,7 @@ The flow is deliberately split into a **short synchronous path** (so `POST /v1/t
 | **PII protection** | Mask phone/email/amount in logs and traces. Minimal retention |
 | **Input validation** | Schema validation, amount upper-bound/positive-value checks, parameterized SQL (ORM to prevent injection) |
 | **Rate limiting / WAF** | Per-user and per-IP token bucket. WAF blocks L7 attacks and bots |
-| **Fraud / AML** | The Fraud Service performs inline rule checks (velocity, new recipient, anomalous amount) and is the sole caller of the external ML/AML APIs; the Payments Service only calls the Fraud Service |
+| **Fraud / AML** | The Fraud Service performs inline rule checks (velocity, new recipient, anomalous amount) and is the sole caller of the external ML/AML APIs; only the Ledger Service's fraud Activity calls the Fraud Service |
 | **Idempotency & replay prevention** | `Idempotency-Key` + request-hash matching (reject same key with a different body) |
 | **Audit** | Record all state changes in an immutable log (who, when, what). WORM via S3 Object Lock |
 | **Compliance** | SOC2 (PCI-DSS out of scope since no card data). Separation of duties, access reviews |
@@ -490,7 +496,7 @@ The flow is deliberately split into a **short synchronous path** (so `POST /v1/t
 - **Event-driven load leveling**: During bursts, the queue acts as a buffer, protecting downstream (e.g., notifications).
 
 ### 6.3 Availability (99.99%)
-- **Multi-AZ**: EKS nodes, Aurora, ElastiCache, and MSK all span multiple AZs.
+- **Multi-AZ**: EKS nodes, Aurora, ElastiCache, MSK, and the Temporal service all span multiple AZs (Temporal Cloud or a self-hosted multi-AZ cluster).
 - **Eliminate SPOFs**: Remove dependence on single instances (see deep-dive Q4 below).
 - **Graceful degradation**: Even if notifications/history go down, **the transfer itself still succeeds** (events remain in the outbox and are delivered later).
 - **Circuit breakers & timeouts**: Cut off + fall back so that latency in external APIs (ML/AML/bank) does not drag down the whole system.
@@ -540,7 +546,7 @@ The volume (~12.6B ledger rows/year) rules out PostgreSQL for the ledger, so mon
 Centered on the deep-dive questions in Part 3, this section lists points likely to be asked in an interview along with model answers.
 
 ### Q1. If the server crashes mid-transfer, how do you recover?
-**A.** No money moves until settlement, which is a single **DynamoDB `TransactWriteItems`** (all-or-nothing) — a crash before it commits leaves no partial debit/credit. The synchronous step only places a `held` reservation; a crash there leaves at most an orphaned hold, which is harmless and swept (released) by a reconciliation job that matches holds to in-flight `transfers`. The settlement workflow is **durable, not in-memory**: its progress lives in `transfers.status` and `transfer_events` (PostgreSQL), so a crash mid-workflow re-drives from the last persisted state. Settlement is idempotent — conditioned on the Idempotency-Key not yet settled — so re-execution is a no-op rather than a double-apply. If the orchestration grows complex, AWS Step Functions provides this durable execution out of the box.
+**A.** No money moves until settlement, which is a single **DynamoDB `TransactWriteItems`** (all-or-nothing) — a crash before it commits leaves no partial debit/credit. The synchronous step only places a `held` reservation; a crash there leaves at most an orphaned hold, which is harmless and swept by a reconciliation job that matches holds to in-flight `transfers` (it also **re-emits `TransferRequested`** if Transfer Service got the hold accepted but crashed before publishing — the event is sent at-least-once and the workflow start is idempotent on `transfer_id`). The settlement lifecycle runs as a **Temporal workflow**, so its state, the moratorium timer, and per-Activity retries are **persisted by Temporal**, not held in process memory. A worker crash mid-workflow is transparent: Temporal replays the workflow's event history on another worker and resumes exactly where it left off (the durable timer keeps counting even while no worker is alive). Each Activity is idempotent — settlement is conditioned on the Idempotency-Key not yet settled — so a retried Activity is a no-op rather than a double-apply. Temporal gives us this durable execution out of the box, which is precisely why we use it instead of a hand-rolled scheduler.
 
 ### Q2. If the same request arrives twice due to a network retry, how do you prevent a double transfer?
 **A.** Require a client-generated `Idempotency-Key`. Two layers: (1) the PostgreSQL `transfers` metadata row has a **unique constraint** on `idempotency_key`, so a duplicate create conflicts and returns the prior response; (2) more importantly, the money mutation's **`TransactWriteItems` includes a guard item** keyed by `transfer_id`/phase with an `attribute_not_exists` condition — so even if the same transaction is retried, the conditional write fails (`ConditionalCheckFailed`) and the balance is debited exactly once. Idempotency thus protects the money write atomically inside DynamoDB, not just at the metadata layer. The stored request hash also lets us reject "the same key with a different body" as a conflict.
@@ -564,11 +570,11 @@ Centered on the deep-dive questions in Part 3, this section lists points likely 
 2. Keep the synchronous path minimal (one conditional hold `UpdateItem`); push fraud/moratorium/settlement/notify to the async workflow.
 3. Use **DynamoDB on-demand or auto-scaling** so capacity tracks the write stream; the `account_id` partition key spreads load and avoids hot partitions in aggregate.
 4. The **PostgreSQL metadata** tier is bounded and small relative to the ledger; scale it with read replicas, and partition by `account_id` only if needed. The balance cache is refreshed by DynamoDB Streams consumers.
-5. Messaging scales by adding Kafka partitions; the workflow scales as stateless workers driven by the durable state.
+5. Messaging scales by adding Kafka partitions; the workflow scales by adding **Temporal workers** (stateless — they poll task queues, with Temporal holding the durable state).
 The next bottleneck, connection count to PostgreSQL, is absorbed by RDS Proxy.
 
 ### Q6. How did you decide service boundaries? Why not split by URL path, and why not a full monolith?
-**A.** Boundaries follow **transactional and data-ownership lines, not URL paths**. The transfer flow, balance/ledger mutations (DynamoDB), and transfer metadata (PostgreSQL) are all part of one money-movement unit and must be coordinated atomically, so splitting them by URL (`/transfers`, `/transactions`, `/accounts`) would force a distributed transaction / Saga on the critical path for no benefit. We therefore keep them in a single **Payments Service** that owns both stores. Conversely, **Fraud**, **User Directory**, and **Notification** are genuinely independent (separate data, separate failure modes, separate scaling) and stay as their own services so their failures don't block money movement. This is neither a full monolith (independent concerns are isolated) nor an over-decomposed mesh (the atomic core stays together).
+**A.** Boundaries follow **data ownership and dependency direction, not URL paths**. All money writes (balances + ledger in DynamoDB, `transfers`/status in PostgreSQL) sit behind one **Ledger Service**, so the atomic writes never cross a service boundary — no distributed transaction. The **Transfer Service** is a thin synchronous front (limit check, resolve, call Ledger to hold). The long-running Temporal workflow is **owned by the Ledger Service itself**: an earlier iteration carved out a separate Workflow Service, but that introduced a cross-service back-call (Workflow → Ledger) on the settlement Activity, which touches the same data Ledger already owns — keeping the workflow inside Ledger turns that into a local function call. The sync initiator (Transfer) is never re-entered: it fires a `TransferRequested` event after the hold, and Ledger consumes it on the workflow side. Direction across services: `Transfer → Ledger`, `Transfer →(event)→ Kafka → Ledger`, `Ledger → Fraud`, `Ledger → Kafka → Notification`. **Fraud**, **User Directory**, and **Notification** stay independent (separate data, failure modes, scaling). It is neither a monolith nor an over-decomposed mesh — each boundary maps to a real concern.
 
 ### Q7. How do you represent monetary amounts? What about floating point?
 **A.** Do not use it. Hold amounts as `bigint` minor units (cents) to eliminate rounding and representation errors. The currency is fixed to USD (per requirements), but a currency code is retained to prepare for future multi-currency.

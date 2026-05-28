@@ -1,0 +1,535 @@
+================================================================================
+P2P MONEY TRANSFER SYSTEM — ARCHITECTURE REVIEW
+Presentation Transcript
+================================================================================
+
+Audience: Engineering team
+Length: ~30 slides
+Estimated speaking time: 35–45 minutes
+
+SLIDE 1 — TITLE: P2P Money Transfer System
+
+Good morning, everyone. Today I'm walking you through the system architecture
+for a real-time peer-to-peer money transfer service — think Zelle or Venmo. The
+five numbers at the bottom of this slide define the problem space we're
+designing into: fifty million registered users, five million daily actives,
+two hundred transactions per second on average bursting to a thousand, four
+nines of availability, and a p99 latency budget of three seconds end to end.
+
+The two design ideas I want you to leave with today are: money lives in
+DynamoDB, not Postgres; and money never actually moves until settlement —
+the synchronous path only places a hold.
+
+
+SLIDE 2 — Problem statement & agenda
+
+
+The problem in one sentence: design a real-time P2P money transfer system,
+identified by phone or email, US dollars only, with instant perceived
+settlement.
+
+The core constraints in the bottom-left card are not negotiable. Money must
+never be lost or created. Balances must be consistent under concurrent
+updates. Retries must never cause a double transfer. And every state change
+must be auditable for seven years.
+
+We'll move through seven sections — requirements and scale, then the six
+design principles, then the high-level architecture, then the data model and
+money flow, then the transfer flows themselves, then trade-offs, and finally
+the deep-dive Q&A that an interviewer or a senior engineer would push us on.
+
+
+SLIDE 3 — Functional scope
+
+
+Six cards on this slide. Core features are send, receive, balance, history.
+Identification is by phone or email — users never enter a bank account
+number. Currency is USD only — no FX in scope. Limits are five hundred
+dollars per transaction and twenty-five hundred per day. Settlement is
+"instant" from the user's perspective, not next-day ACH. And explicitly out
+of scope: account creation, investments, and card payments. That last bullet
+matters because it's what takes PCI-DSS off our compliance plate.
+
+
+SLIDE 4 — Non-functional targets
+
+
+These six numbers drive almost every architectural decision later in the
+deck. Fifty million users at five million DAU is medium-large scale. Two
+hundred TPS average isn't extreme, but peak of a thousand and a future tenx
+target shapes our partitioning strategy. The three-second p99 means the
+synchronous path has to stay short — which is exactly why fraud, AML and
+settlement get pushed off into an async workflow. Four nines means we have
+about fifty minutes of downtime per year — call it four-and-a-half minutes
+per month — so we need multi-AZ everywhere and graceful degradation paths.
+And seven-year retention is the regulatory anchor for the ledger sizing.
+
+
+SLIDE 5 — Security & compliance scope
+
+
+Four bands. KYC and authentication are handled upstream — we assume users
+arrive with a verified JWT, and we verify it at the gateway. Fraud is split:
+cheap deterministic rules run inline, and ML scoring is an external API we
+only call synchronously when we already think a transaction is high-risk.
+AML screening is an external API too — sanctions-list matching, not built
+in-house. SOC2 is our compliance target. PCI-DSS is out of scope because
+we never handle card data — we operate on internal balances.
+
+
+SLIDE 6 — Back-of-the-envelope capacity
+
+
+This is the slide that drives our storage choice. Two hundred TPS times two
+ledger rows per transfer — one debit, one credit — times the seconds in a
+year gives us roughly twelve-point-six billion ledger rows per year. Over
+seven years of retention that's about eighty-eight billion rows. At one
+kilobyte per row we're looking at thirteen terabytes per year, ninety
+terabytes total.
+
+Two important takeaways. First, reads outnumber writes about tenx — balance
+checks and history queries. Second, on the right: all amounts are bigint
+minor units, cents. Never floating point. We keep a currency code on every
+row so we can extend to multi-currency later, but the arithmetic itself is
+strictly integer.
+
+
+SLIDE 7 — Six design principles
+
+
+These six principles are the lens for every decision later. Correctness
+first — money is neither lost nor created. Idempotency — client-generated
+keys make retries safe at every layer. Immutable audit log — the ledger is
+append-only, and balance is the aggregated result, never overwritten.
+Tiered consistency — money is strongly consistent, notifications and view
+caches are eventually consistent. Failure-oriented design — assume every
+component fails, eliminate single points of failure. And finally, the one
+that's most architecturally distinctive: sync hold, async settle. We'll
+unpack that one in detail on slide eighteen.
+
+
+SLIDE 8 — Polyglot persistence: DynamoDB for money
+
+
+This is the headline storage decision. Twelve-point-six billion rows per
+year is more than we want to run on PostgreSQL. So money — the balance
+items and the full double-entry ledger — lives in DynamoDB. PostgreSQL
+keeps everything else: users, identifiers, transfer metadata, workflow
+state, and a display cache for balance.
+
+Two things I want to call out from the right column. The display cache is
+refreshed asynchronously from DynamoDB Streams. It is never authoritative.
+It is never used for the debit decision. If staleness in the cache could
+cause a wrong debit, we'd have a bug. The decision to debit is always made
+against DynamoDB.
+
+
+SLIDE 9 — High-level component view
+
+
+Top to bottom. At the edge, requests pass through CloudFront, then WAF,
+then API Gateway or ALB which terminates TLS, verifies the JWT, and routes.
+
+In the services tier on the left, the big teal box is the Payments Service.
+This is the money-movement core — transfer flow, idempotency control, limit
+checks, balance and ledger writes, history reads. It owns the writes to the
+balance. Nothing else writes balance.
+
+On the right, three independent services: User Directory for resolving
+phone or email to a user ID, Fraud Rule Engine for risk checks, and
+Notification for push, SMS, and email — all asynchronous.
+
+At the bottom, the data tier: DynamoDB for the authoritative money,
+Aurora PostgreSQL for metadata and the display cache, ElastiCache for rate
+limiting and sessions, and Kafka via MSK for our async event bus and
+transactional outbox.
+
+
+SLIDE 10 — Service decomposition: by data, not by URL
+
+
+This is the principle behind that diagram. We do not split services along
+URL paths. We split along transactional and data-ownership boundaries.
+
+On the left: the transfer flow, the balance and ledger writes, and the
+transaction history are all inside the same Payments Service because they
+read and write the same data and have to participate in the same ACID
+transaction. Splitting them by URL — one service for slash-transfers,
+another for slash-accounts — would force a distributed transaction or a
+Saga on the critical money-movement path. That's accidental complexity for
+no benefit.
+
+On the right: Fraud, User Directory, and Notification are genuinely
+independent. Different data, different failure modes, different scaling
+profiles. Their failures should never block money movement.
+
+
+SLIDE 11 — Why this split — vs monolith, vs URL-based
+
+
+Quick comparison table. A pure monolith gets money atomicity easily but
+couples notification failures to the money core. A URL-based split gets
+fault isolation but pays for it with distributed transactions on the
+critical path. Our split keeps the atomic core whole — Payments owns both
+the DynamoDB writes and the Postgres metadata — while peeling off the
+genuinely independent concerns.
+
+The italicized callout at the bottom is the incremental-design principle:
+start with these four services, split further only when a real
+transactional or scaling boundary demands it. Never because a different
+URL prefix exists.
+
+
+SLIDE 12 — Key components & responsibilities
+
+
+Six rows. The API Gateway terminates TLS, verifies JWTs, rate-limits, and
+routes. The Payments Service is the money-movement core — it's the sole
+owner of balance updates. User Directory resolves email and phone to user
+IDs. The Fraud Rule Engine runs inline rule checks AND it's the sole
+caller of the external ML and AML APIs — we'll come back to that on the
+next slide. The Notification Service does push, SMS, email — all async.
+And the Event Bus, Kafka or SQS, carries async inter-service messages and
+the transactional outbox.
+
+
+SLIDE 13 — External integrations: encapsulated by Fraud Service
+
+
+This is a small but important architectural decision. The Payments Service
+does NOT call external risk APIs directly. It calls the Fraud Service, and
+the Fraud Service is the sole integration point for ML scoring and AML
+screening.
+
+Why? Because vendor SDKs, credentials, fallback policies, and false-positive
+handling are operationally messy. Keeping them inside a dedicated service
+means none of that complexity bleeds into the money-movement core.
+
+The bank network — RTP, FedNow — is externalized too. We treat it as a
+stable downstream dependency, protected by circuit breaker, timeout, and
+fallback.
+
+
+SLIDE 14 — Kubernetes on EKS, multi-AZ
+
+
+Six rows on deployment. We're on Amazon EKS, multi-AZ. Autoscaling uses
+HPA based on CPU and a custom TPS metric, plus the Cluster Autoscaler for
+nodes. Service mesh — Istio or App Mesh — gives us mTLS, retries, circuit
+breaking, and observability. Secrets come from AWS Secrets Manager via the
+External Secrets Operator. Deployments are rolling or canary via Argo
+Rollouts — zero downtime is non-negotiable at four nines. And pod placement
+uses PodAntiAffinity and topology spread constraints so no service is ever
+concentrated in a single AZ.
+
+The data stores stay outside the cluster as managed services. Smaller blast
+radius, less operational overhead.
+
+
+SLIDE 15 — Cross-cutting concerns
+
+
+Eight tiles you'd expect on any production system. Auth, metrics, tracing,
+logging, alerting, audit, config management, rate limiting. The one I want
+to flag specifically is the audit log — append-only with S3 Object Lock
+in WORM mode, seven-year retention. That's a SOC2 hard requirement and it
+also gives us a tamper-resistant story for regulator audits.
+
+
+SLIDE 16 — SLIs and SLOs
+
+
+Four headline numbers. Transfer success rate at or above ninety-nine
+point ninety-five percent. p99 latency at or below three seconds.
+Availability at four nines, which is about fifty minutes per year. And
+balance consistency — one hundred percent, verified by daily reconciliation.
+
+The bottom panel is how we actually verify these. The most important is
+continuous reconciliation: we replay each account's settled ledger and
+check that the chain holds — previous plus amount equals next equals
+current available. And we verify that each account's "held" counter
+matches the sum of its in-flight transfers. Any divergence raises an alert
+because at that point we have a real correctness problem.
+
+
+SLIDE 17 — Data model: entities & ownership
+
+
+Eight entities, color-coded by store. Two in DynamoDB — balance and
+ledger. Six in PostgreSQL — users, identifiers, account metadata,
+transfer metadata, workflow events, idempotency keys.
+
+The teal callout at the bottom is the core invariant: spendable equals
+available minus held. And every balance mutation conditions on the
+version field and bumps it. That's the optimistic lock that prevents
+lost updates — we'll see it in action on slide twenty-seven.
+
+
+SLIDE 18 — Hold-then-settle, no escrow
+
+
+This is the most distinctive piece of the design. Three columns, one per
+phase.
+
+At POST, synchronous: we reserve. One conditional UpdateItem on the
+sender's balance. Held increases by the amount, version bumps. The
+condition is that available minus held is still greater than or equal to
+the amount — that's the overspend check, atomic with the write. No
+ledger entry. No money has moved.
+
+At settlement, asynchronous, after fraud review and the moratorium: we
+move. One TransactWriteItems. Sender's available drops by the amount,
+held drops by the amount, recipient's available rises by the amount, and
+we append both ledger entries. The transaction is conditioned on the
+idempotency key not having settled before — exactly-once settlement.
+
+On cancel or deny: we release the hold. Held drops by the amount. No
+ledger entry, because no money ever moved. There's nothing to claw back.
+
+That last point is the elegance. Cancellation is just letting go of a
+hold. It's not a compensating transaction. There's no escrow account
+sitting in the middle. Money moves exactly once, at settlement.
+
+
+SLIDE 19 — API contract
+
+
+Six endpoints. POST slash-transfers creates and executes a transfer — and
+the Idempotency-Key header is required. GETs are naturally idempotent.
+POST slash-transfers-slash-ID-slash-cancel cancels during the moratorium
+window, before settlement. POST slash-transfers-slash-ID-slash-reverse is
+the post-settlement refund — that's a compensating transaction, and it
+also requires an idempotency key.
+
+Every write carries Authorization Bearer JWT and an Idempotency-Key
+header generated by the client.
+
+
+SLIDE 20 — Synchronous transfer flow
+
+
+Five steps in the sync path, and the goal is to return within the p99
+latency budget.
+
+Step one: insert the transfer metadata row in PostgreSQL with the
+idempotency key. Unique constraint catches replays — a duplicate just
+returns the stored response.
+
+Step two: limit check. Five hundred per transaction, twenty-five hundred
+per day. Cheap, deterministic, reject early.
+
+Step three: resolve the recipient identifier — phone or email — to a
+user ID via the User Directory service.
+
+Step four: reserve funds. The conditional UpdateItem we just talked about.
+
+Step five: return 200 OK with status DEBITED, and publish a
+TransferRequested event to Kafka.
+
+That's it for the sync path. Everything else is async.
+
+
+SLIDE 21 — Async settlement workflow
+
+
+Four stages, and the critical property is that this workflow is durable
+and resumable. State lives in the transfers status field and the
+transfer_events table — both in PostgreSQL. A crash mid-workflow just
+re-drives from the last persisted state. If this gets complex enough, we
+move it to Step Functions which gives us durable execution out of the
+box.
+
+Stage one: fraud and AML. Most transfers pass cleanly. A small fraction
+go to human approval.
+
+Stage two: moratorium. We wait until the settle_after timestamp. This
+gives the user a cancellation window. It's risk-tiered — for low-risk
+transfers we set it to near zero, so settlement is effectively instant.
+For high-risk we apply a longer hold.
+
+Stage three: settlement. The TransactWriteItems we keep referring to.
+Money actually moves here, exactly once.
+
+Stage four: notifications fan out.
+
+And if at stage one or two the answer is deny or cancel — release the
+hold. No ledger entry. Money never moved.
+
+
+SLIDE 22 — Security: defense in depth
+
+
+Eight tiles. Standard layered security. The bits I'll highlight are
+specific to our domain: amount bounds and positive-value checks at input
+validation — never trust the client to send a sane number. Per-user and
+per-IP rate limiting with token buckets. The fraud bullet — ML and AML
+only via the Fraud Service, never directly from Payments. And the audit
+log with WORM via S3 Object Lock, immutable for seven years.
+
+
+SLIDE 23 — Trade-off: DynamoDB for money, PostgreSQL for metadata
+
+
+The detailed trade-off table for the polyglot persistence choice. Five
+rows. DynamoDB holds the balance items and the full ledger; PostgreSQL
+holds users, transfer metadata, workflow events, and the display cache.
+DynamoDB gives us TransactWriteItems for atomic balanced entries;
+PostgreSQL gives us multi-row ACID for metadata. DynamoDB scales near-
+unlimited horizontally by account_id; PostgreSQL is bounded and easy to
+operate. DynamoDB is strongly consistent on the conditional writes; the
+cache is eventually consistent through DynamoDB Streams.
+
+The trade-off callout at the bottom is the honest one: putting money in
+DynamoDB means overspend prevention and ordering have to be expressed as
+conditional appends rather than SQL SERIALIZABLE. We accepted that
+constraint because the ledger volume is operationally infeasible in
+PostgreSQL.
+
+
+SLIDE 24 — Other tunable decisions
+
+
+Eight more axes where the design could go differently and what the trade-
+off would be. The check marks show the choice we made.
+
+Transfer confirmation — fully sync is simpler UX but no room for fraud
+review or cancellation. We chose sync hold plus async settle.
+
+Moratorium length — tunable per risk tier, zero for low-risk effectively
+gives instant delivery.
+
+Consistency model — money strong, display and notifications eventual.
+
+Hot accounts — single ledger by default; if one account becomes a real
+hotspot, model it as sub-accounts.
+
+Messaging, fraud, multi-region, payment network — each row has a sensible
+default and a forward-looking expansion path.
+
+
+SLIDE 25 — Deep dive Q1: crash recovery
+
+
+Now we're into the questions a senior engineer or interviewer will push
+us on.
+
+Question one: if the server crashes mid-transfer, how do you recover?
+The answer is at the top: no money moves until settlement, which is a
+single atomic DynamoDB TransactWriteItems. A crash before the commit
+leaves no partial debit or credit — it's all-or-nothing.
+
+Four points below. The sync step only places a hold — a crash there
+leaves at most an orphaned hold which is harmless and gets swept by
+reconciliation. Workflow state is durable in PostgreSQL, not in-memory,
+so we re-drive from the last persisted state. Settlement is idempotent —
+conditioned on the idempotency key not yet settled, so retries are no-ops.
+And if orchestration gets complex, Step Functions gives us durable
+execution for free.
+
+
+SLIDE 26 — Deep dive Q2: idempotency
+
+
+Question two: how do you prevent double transfers on retries?
+
+Two layers. Layer one in PostgreSQL: the transfers table has a unique
+constraint on the idempotency key. A duplicate insert conflicts, and we
+return the stored response. We also store the request hash so we can
+reject the case where the same key arrives with a different body —
+that's a client bug we should surface, not absorb.
+
+Layer two — and this is the one that matters most — in DynamoDB. The
+TransactWriteItems for settlement includes a guard item keyed by the
+transfer ID, with an attribute_not_exists condition. So even if the same
+transaction is retried, the conditional write fails and the balance is
+debited exactly once. Idempotency is protected at the money write
+itself, not only at the metadata layer.
+
+
+SLIDE 27 — Deep dive Q3: concurrency
+
+
+Question three: how do you ensure consistency under concurrent updates?
+
+The answer is the optimistic lock on the balance's version field. Every
+write reads version equals V, conditions on version equals V, and sets
+version to V plus one.
+
+Three scenarios on this slide. Two settlements crediting the same
+recipient — only one commits, the other aborts on the version mismatch
+and retries. A debit and a credit racing on the same account — the
+version chain forces an order, both succeed exactly once, and the ledger
+records the actual sequence. And an overspend attempt — the available
+minus held check is atomic with the conditional write, so there's no
+TOCTOU window, no overspend.
+
+The decision is never made against the PostgreSQL cache. Debits always
+read and condition on DynamoDB.
+
+
+SLIDE 28 — Deep dive Q4: SPOFs
+
+
+Question four: where are the single points of failure?
+
+Going through the layers. Money store — DynamoDB is multi-AZ and
+regionally replicated by design, so no single node to lose. Metadata —
+Aurora multi-AZ with read replicas and automatic failover. Cache —
+ElastiCache cluster mode; and remember the Postgres balance cache is
+non-authoritative, so even if it goes stale a debit isn't affected.
+Messaging — MSK across multiple brokers. Compute — EKS multi-AZ. Edge —
+DNS failover via CloudFront and Route 53. External APIs — circuit
+breaker plus timeout plus fallback; if ML scoring is down, we degrade
+to rule-based.
+
+
+SLIDE 29 — Deep dive Q5: 10x scale
+
+
+Question five: at ten thousand TPS, where's the bottleneck?
+
+The headline is that DynamoDB scales near-linearly because it partitions
+by account_id. The money store is not our first wall.
+
+The first real risk is a single very hot account — like a massive
+merchant. Per-account writes serialize on the seq chain, which is
+correct but is a hotspot. The fix is to model that one account as N
+sub-accounts and route and aggregate across them. We only apply this to
+the rare hotspot.
+
+Keep the sync path minimal — one hold UpdateItem, nothing else. Use
+DynamoDB on-demand or auto-scaling. PostgreSQL is bounded relative to
+the ledger — scale with read replicas, partition by account_id only if
+needed, absorb connection count with RDS Proxy. Messaging scales by
+adding Kafka partitions. Workers scale as stateless replicas.
+
+
+SLIDE 30 — Key takeaways: what this design gets right
+
+
+Six takeaways to close.
+
+One — polyglot persistence: DynamoDB for money, PostgreSQL for metadata,
+driven by the twelve-point-six billion rows per year scale number.
+
+Two — hold-then-settle without escrow: sync hold for instant UX, async
+settlement to allow fraud review and cancellation.
+
+Three — idempotency at the money write itself: two layers, PostgreSQL
+unique key plus DynamoDB conditional guard.
+
+Four — optimistic locking on balance.version: serializes concurrent
+updates to the same account, no lost updates.
+
+Five — boundaries follow data, not URLs: money core stays atomic, risk
+and notification stay independent.
+
+Six — immutable append-only ledger: double-entry, seven-year retention,
+WORM audit, reconciled daily.
+
+Closing line: correctness first, idempotent everywhere, no SPOFs,
+reconcile continuously. Happy to take questions.
+
+================================================================================
+END OF TRANSCRIPT
+================================================================================
