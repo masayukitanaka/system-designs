@@ -3,10 +3,13 @@ graph TB
         U["クライアント"]
     end
 
-    subgraph AWS["AWS リージョン (Multi-AZ)"]
+    subgraph Edge["グローバル / エッジ (リージョン非依存)"]
         R53["Route 53"]
-        WAFCF["CloudFront + WAF"]
+        CF["CloudFront (CDN)"]
+        WAF["AWS WAF"]
+    end
 
+    subgraph AWS["AWS リージョン (Multi-AZ)"]
         subgraph EKS["Amazon EKS クラスタ"]
             ING["Ingress Controller<br/>(ALB Ingress / NGINX)"]
 
@@ -37,11 +40,11 @@ graph TB
             REDIS[("ElastiCache Redis<br/>(クラスタモード)")]
             MSK["MSK (Kafka)"]
             TEMPORAL["Temporal Service<br/>(Temporal Cloud / セルフホスト)<br/>状態・タイマー・リトライを永続管理"]
-            S3B["S3 / Glacier"]
+            S3B["S3 Object Lock (WORM) / Glacier<br/>監査ログ + DynamoDBエクスポート"]
         end
     end
 
-    U --> R53 --> WAFCF --> ING
+    U --> R53 --> CF --> WAF --> ING
     ING --> TPOD
     TPOD -.mTLS.- MESH
     TPOD --> UPOD

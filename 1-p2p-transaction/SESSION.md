@@ -3,7 +3,7 @@
 このファイルは次回セッションで文脈を素早く取り戻すためのメモ。
 **設計の最終内容は `README.md`（英語）/ `README-ja.md`（日本語）が正**。ここには README に書かない「経緯・確定済みの判断・運用知識・落とし穴」を残す。
 
-最終更新: 2026-05-27（Workflow Service 廃止、Ledger Service が Temporal ワークフローを内包）
+最終更新: 2026-05-28（状態確認・git情報の最新化。設計は前回 §2 のまま変更なし）
 
 ---
 
@@ -100,6 +100,8 @@ mmdc -i <name>.mmd    -o ../<name>-ja.png -p puppeteer.json -b white -s 2
 
 ## 6. 状態・未了事項
 
-- **git**: 作業はコミット済み（最新 `88367dd remove escrow`）。ワーキングツリーはクリーン。ブランチは `main`。
+- **git**: README 2言語・図ソース(`diagrams/*.mmd`)・PNG・SESSION.md はコミット済み。**最新コミットは `9a51dfe Temporal`**（直近の履歴: `9a51dfe Temporal` → `ef7c8ff version lock` → `43d9ff0 session` → `88367dd remove escrow`）。ブランチは `main`、ワーキングツリーはクリーン。
+  - 注意: ただし `9a51dfe Temporal` は **Workflow Service を Ledger に畳む前**の可能性がある。最後の数手（イベント発火を Transfer に移動、Workflow Service 廃止）が未コミットなら別途コミットが必要 — 次回 `git show 9a51dfe --stat` と現行ファイルを照合して確認すること（このセッションのファイルはすべて現行設計に更新済み）。
 - リモート upstream は gone（`git status` に出る）。push 先は要確認。
-- 次に設計変更の指示が来たら: **README 2言語 + 該当する図ソース 2言語を更新 → PNG再生成 → escrow等の旧語が残っていないか grep で全ファイル確認**、という順序を守る（§4の検証を毎回やる）。
+- **presentation 系は git 管理外**: `presentation.txt`（英語プレゼン原稿）/ `presentation-ja.txt`（その日本語訳, 当方作成）/ `presentation.pptx` / `presentation.mp3` は追跡対象外（コミットされていない）。⚠️ **これらは設計が Payments Service 統合・Step Functions だった頃の内容を反映しており、現行（Temporal / Transfer・Ledger 分割）とズレている**。プレゼンを使う場合は最新設計に合わせて作り直しが必要。
+- 次に設計変更の指示が来たら: **README 2言語 + 該当する図ソース 2言語を更新 → PNG再生成 → 旧語（escrow / Payments Service / Workflow Service / Step Functions 等）が残っていないか grep で全ファイル確認**、という順序を守る（§4の検証を毎回やる）。

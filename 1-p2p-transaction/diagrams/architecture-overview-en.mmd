@@ -33,7 +33,7 @@ graph TB
         DDB[("<b>DynamoDB — source of truth (money)</b><br/>balance items (available / held) + ledger (~12.6B rows/yr, 7-year)<br/>POST: hold (reserve); SETTLE: move money + append ledger<br/>conditional writes + idempotency guard")]
         LEDGERDB[("PostgreSQL (Aurora)<br/>metadata: users / transfers meta / events / idempotency<br/>+ balance <i>display cache</i> (NOT authoritative)")]
         CACHE[("Redis<br/>cache / rate limit")]
-        ARCHIVE[("S3 + Glacier<br/>long-term audit / DynamoDB export")]
+        ARCHIVE[("S3 Object Lock (WORM) + Glacier<br/>append-only audit log, 7-year / DynamoDB export")]
     end
 
     subgraph External["External Integrations"]

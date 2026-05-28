@@ -3,10 +3,13 @@ graph TB
         U["Client"]
     end
 
-    subgraph AWS["AWS Region (Multi-AZ)"]
+    subgraph Edge["Global / Edge (not region-bound)"]
         R53["Route 53"]
-        WAFCF["CloudFront + WAF"]
+        CF["CloudFront (CDN)"]
+        WAF["AWS WAF"]
+    end
 
+    subgraph AWS["AWS Region (Multi-AZ)"]
         subgraph EKS["Amazon EKS Cluster"]
             ING["Ingress Controller<br/>(ALB Ingress / NGINX)"]
 
@@ -37,11 +40,11 @@ graph TB
             REDIS[("ElastiCache Redis<br/>(cluster mode)")]
             MSK["MSK (Kafka)"]
             TEMPORAL["Temporal Service<br/>(Temporal Cloud or self-hosted)<br/>durable state, timers, retries"]
-            S3B["S3 / Glacier"]
+            S3B["S3 Object Lock (WORM) / Glacier<br/>audit log + DynamoDB export"]
         end
     end
 
-    U --> R53 --> WAFCF --> ING
+    U --> R53 --> CF --> WAF --> ING
     ING --> TPOD
     TPOD -.mTLS.- MESH
     TPOD --> UPOD

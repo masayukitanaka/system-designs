@@ -33,7 +33,7 @@ graph TB
         DDB[("<b>DynamoDB — 正 (金額)</b><br/>残高アイテム (available / held) + 台帳 (約126億行/年, 7年)<br/>POST: hold(予約); SETTLE: 送金 + 台帳追記<br/>条件付き書込 + 冪等ガード")]
         LEDGERDB[("PostgreSQL (Aurora)<br/>メタデータ: users / transfersメタ / events / idempotency<br/>+ 残高<i>表示キャッシュ</i> (正ではない)")]
         CACHE[("Redis<br/>キャッシュ / レート制限")]
-        ARCHIVE[("S3 + Glacier<br/>監査長期保管 / DynamoDBエクスポート")]
+        ARCHIVE[("S3 Object Lock (WORM) + Glacier<br/>追記専用 監査ログ, 7年 / DynamoDBエクスポート")]
     end
 
     subgraph External["外部連携"]
